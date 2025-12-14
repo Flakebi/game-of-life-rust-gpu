@@ -1,26 +1,8 @@
-#![warn(
-    clippy::use_self,
-    deprecated_in_future,
-    rust_2018_idioms,
-    trivial_casts,
-    trivial_numeric_casts,
-    unused_qualifications
-)]
-
 use std::default::Default;
 use std::error::Error;
-use std::io::Cursor;
+use std::ffi;
 use std::mem;
-use std::mem::{align_of, size_of, size_of_val};
-use std::{borrow::Cow, cell::RefCell, ffi, ops::Drop, os::raw::c_char};
-use winit::{
-    event::{ElementState, Event, KeyEvent, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
-    keyboard::{Key, NamedKey},
-    platform::run_on_demand::EventLoopExtRunOnDemand,
-    raw_window_handle::{HasDisplayHandle, HasWindowHandle},
-    window::WindowBuilder,
-};
+use std::{borrow::Cow, cell::RefCell, ops::Drop, os::raw::c_char};
 
 use ash::util::*;
 use ash::vk;
@@ -29,9 +11,14 @@ use ash::{
     ext::debug_utils,
     khr::{surface, swapchain},
 };
-
-// The maximum number of frames we allow to be in flight at any given time
-pub const MAX_FRAME_LATENCY: usize = 3;
+use winit::{
+    event::{ElementState, Event, KeyEvent, WindowEvent},
+    event_loop::{ControlFlow, EventLoop},
+    keyboard::{Key, NamedKey},
+    platform::run_on_demand::EventLoopExtRunOnDemand,
+    raw_window_handle::{HasDisplayHandle, HasWindowHandle},
+    window::WindowBuilder,
+};
 
 // Simple offset_of macro akin to C++ offsetof
 #[macro_export]
@@ -44,7 +31,9 @@ macro_rules! offset_of {
         }
     }};
 }
-
+/// Helper function for submitting command buffers. Immediately waits for the fence before the command buffer
+/// is executed. That way we can delay the waiting for the fences by 1 frame which is good for performance.
+/// Make sure to create the fence in a signaled state on the first use.
 #[allow(clippy::too_many_arguments)]
 pub fn record_submit_commandbuffer<F: FnOnce(&Device, vk::CommandBuffer)>(
     device: &Device,
@@ -57,6 +46,14 @@ pub fn record_submit_commandbuffer<F: FnOnce(&Device, vk::CommandBuffer)>(
     f: F,
 ) {
     unsafe {
+        device
+            .wait_for_fences(&[command_buffer_reuse_fence], true, u64::MAX)
+            .expect("Wait for fence failed.");
+
+        device
+            .reset_fences(&[command_buffer_reuse_fence])
+            .expect("Reset fences failed.");
+
         device
             .reset_command_buffer(
                 command_buffer,
@@ -95,19 +92,19 @@ unsafe extern "system" fn vulkan_debug_callback(
     p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
     _user_data: *mut std::os::raw::c_void,
 ) -> vk::Bool32 {
-    let callback_data = *p_callback_data;
+    let callback_data = unsafe { *p_callback_data };
     let message_id_number = callback_data.message_id_number;
 
     let message_id_name = if callback_data.p_message_id_name.is_null() {
         Cow::from("")
     } else {
-        ffi::CStr::from_ptr(callback_data.p_message_id_name).to_string_lossy()
+        unsafe { ffi::CStr::from_ptr(callback_data.p_message_id_name).to_string_lossy() }
     };
 
     let message = if callback_data.p_message.is_null() {
         Cow::from("")
     } else {
-        ffi::CStr::from_ptr(callback_data.p_message).to_string_lossy()
+        unsafe { ffi::CStr::from_ptr(callback_data.p_message).to_string_lossy() }
     };
 
     println!(
@@ -141,7 +138,6 @@ pub struct ExampleBase {
     pub debug_utils_loader: debug_utils::Instance,
     pub window: winit::window::Window,
     pub event_loop: RefCell<EventLoop<()>>,
-    pub frame_index: RefCell<usize>,
     pub debug_call_back: vk::DebugUtilsMessengerEXT,
 
     pub pdevice: vk::PhysicalDevice,
@@ -158,22 +154,22 @@ pub struct ExampleBase {
     pub present_image_views: Vec<vk::ImageView>,
 
     pub pool: vk::CommandPool,
-    pub draw_command_buffers: [vk::CommandBuffer; MAX_FRAME_LATENCY],
+    pub draw_command_buffer: vk::CommandBuffer,
     pub setup_command_buffer: vk::CommandBuffer,
-    pub app_setup_command_buffer: vk::CommandBuffer,
 
     pub depth_image: vk::Image,
     pub depth_image_view: vk::ImageView,
     pub depth_image_memory: vk::DeviceMemory,
 
-    pub present_complete_semaphores: [vk::Semaphore; MAX_FRAME_LATENCY],
-    pub rendering_complete_semaphores: Vec<vk::Semaphore>,
+    pub present_complete_semaphore: vk::Semaphore,
+    pub rendering_complete_semaphore: vk::Semaphore,
 
-    pub draw_commands_reuse_fences: [vk::Fence; MAX_FRAME_LATENCY],
+    pub draw_commands_reuse_fence: vk::Fence,
+    pub setup_commands_reuse_fence: vk::Fence,
 }
 
 impl ExampleBase {
-    pub fn render_loop<F: Fn(usize)>(&self, f: F) -> Result<(), impl Error> {
+    pub fn render_loop<F: Fn()>(&self, f: F) -> Result<(), impl Error> {
         self.event_loop.borrow_mut().run_on_demand(|event, elwp| {
             elwp.set_control_flow(ControlFlow::Poll);
             match event {
@@ -193,24 +189,7 @@ impl ExampleBase {
                 } => {
                     elwp.exit();
                 }
-                Event::AboutToWait => {
-                    let mut frame_index = self.frame_index.borrow_mut();
-
-                    // The fence from 3 frames ago, that will also be signaled this frame
-                    let draw_commands_reuse_fence =
-                        self.draw_commands_reuse_fences[*frame_index % MAX_FRAME_LATENCY];
-                    unsafe {
-                        self.device
-                            .wait_for_fences(&[draw_commands_reuse_fence], true, u64::MAX)
-                    }
-                    .expect("Wait for fence failed.");
-
-                    unsafe { self.device.reset_fences(&[draw_commands_reuse_fence]) }
-                        .expect("Reset fences failed.");
-
-                    f(*frame_index);
-                    *frame_index += 1;
-                }
+                Event::AboutToWait => f(),
                 _ => (),
             }
         })
@@ -220,7 +199,7 @@ impl ExampleBase {
         unsafe {
             let event_loop = EventLoop::new()?;
             let window = WindowBuilder::new()
-                .with_title("Ash - Example")
+                .with_title("Game of Life")
                 .with_inner_size(winit::dpi::LogicalSize::new(
                     f64::from(window_width),
                     f64::from(window_height),
@@ -228,16 +207,18 @@ impl ExampleBase {
                 .build(&event_loop)
                 .unwrap();
             let entry = Entry::load().expect("Failed to load Vulkan");
-            let app_name = c"Game of Life";
+            let app_name = ffi::CStr::from_bytes_with_nul_unchecked(b"VulkanTriangle\0");
 
-            let layer_names = [c"VK_LAYER_KHRONOS_validation"];
+            let layer_names = [ffi::CStr::from_bytes_with_nul_unchecked(
+                b"VK_LAYER_KHRONOS_validation\0",
+            )];
             let layers_names_raw: Vec<*const c_char> = layer_names
                 .iter()
                 .map(|raw_name| raw_name.as_ptr())
                 .collect();
 
             let mut extension_names =
-                ash_window::enumerate_required_extensions(event_loop.display_handle()?.as_raw())
+                ash_window::enumerate_required_extensions(window.display_handle()?.as_raw())
                     .unwrap()
                     .to_vec();
             extension_names.push(debug_utils::NAME.as_ptr());
@@ -274,25 +255,22 @@ impl ExampleBase {
                 )
                 .pfn_user_callback(Some(vulkan_debug_callback));
 
-            let debug_utils_loader = debug_utils::Instance::load(&entry, &instance);
+            let debug_utils_loader = debug_utils::Instance::new(&entry, &instance);
             let debug_call_back = debug_utils_loader
                 .create_debug_utils_messenger(&debug_info, None)
                 .unwrap();
-
-            let surface_factory = ash_window::SurfaceFactory::new(
+            let surface = ash_window::create_surface(
                 &entry,
                 &instance,
-                event_loop.display_handle()?.as_raw(),
+                window.display_handle()?.as_raw(),
+                window.window_handle()?.as_raw(),
+                None,
             )
             .unwrap();
-            let surface = surface_factory
-                .create_surface(window.window_handle()?.as_raw(), None)
-                .unwrap();
-            let surface_loader = surface::Instance::load(&entry, &instance);
-
             let pdevices = instance
                 .enumerate_physical_devices()
                 .expect("Physical device error");
+            let surface_loader = surface::Instance::new(&entry, &instance);
             let (pdevice, queue_family_index) = pdevices
                 .iter()
                 .find_map(|pdevice| {
@@ -377,7 +355,7 @@ impl ExampleBase {
                 .cloned()
                 .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
                 .unwrap_or(vk::PresentModeKHR::FIFO);
-            let swapchain_loader = swapchain::Device::load(&instance, &device);
+            let swapchain_loader = swapchain::Device::new(&instance, &device);
 
             let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
                 .surface(surface)
@@ -404,7 +382,7 @@ impl ExampleBase {
             let pool = device.create_command_pool(&pool_create_info, None).unwrap();
 
             let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
-                .command_buffer_count(2 + MAX_FRAME_LATENCY as u32)
+                .command_buffer_count(2)
                 .command_pool(pool)
                 .level(vk::CommandBufferLevel::PRIMARY);
 
@@ -412,10 +390,7 @@ impl ExampleBase {
                 .allocate_command_buffers(&command_buffer_allocate_info)
                 .unwrap();
             let setup_command_buffer = command_buffers[0];
-            let app_setup_command_buffer = command_buffers[1];
-            let draw_command_buffers = command_buffers[2..][..MAX_FRAME_LATENCY]
-                .try_into()
-                .unwrap();
+            let draw_command_buffer = command_buffers[1];
 
             let present_images = swapchain_loader.get_swapchain_images(swapchain).unwrap();
             let present_image_views: Vec<vk::ImageView> = present_images
@@ -474,10 +449,20 @@ impl ExampleBase {
                 .bind_image_memory(depth_image, depth_image_memory, 0)
                 .expect("Unable to bind depth image memory");
 
+            let fence_create_info =
+                vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+
+            let draw_commands_reuse_fence = device
+                .create_fence(&fence_create_info, None)
+                .expect("Create fence failed.");
+            let setup_commands_reuse_fence = device
+                .create_fence(&fence_create_info, None)
+                .expect("Create fence failed.");
+
             record_submit_commandbuffer(
                 &device,
                 setup_command_buffer,
-                vk::Fence::null(),
+                setup_commands_reuse_fence,
                 present_queue,
                 &[],
                 &[],
@@ -527,31 +512,15 @@ impl ExampleBase {
 
             let semaphore_create_info = vk::SemaphoreCreateInfo::default();
 
-            let present_complete_semaphores = std::array::from_fn(|_| {
-                device
-                    .create_semaphore(&semaphore_create_info, None)
-                    .unwrap()
-            });
-            let rendering_complete_semaphores = (0..present_images.len())
-                .map(|_| {
-                    device
-                        .create_semaphore(&semaphore_create_info, None)
-                        .unwrap()
-                })
-                .collect();
-
-            let fence_create_info =
-                vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-
-            let draw_commands_reuse_fences = std::array::from_fn(|_| {
-                device
-                    .create_fence(&fence_create_info, None)
-                    .expect("Create fence failed.")
-            });
+            let present_complete_semaphore = device
+                .create_semaphore(&semaphore_create_info, None)
+                .unwrap();
+            let rendering_complete_semaphore = device
+                .create_semaphore(&semaphore_create_info, None)
+                .unwrap();
 
             Ok(Self {
                 event_loop: RefCell::new(event_loop),
-                frame_index: RefCell::new(0),
                 entry,
                 instance,
                 device,
@@ -568,14 +537,14 @@ impl ExampleBase {
                 present_images,
                 present_image_views,
                 pool,
-                draw_command_buffers,
+                draw_command_buffer,
                 setup_command_buffer,
-                app_setup_command_buffer,
                 depth_image,
                 depth_image_view,
-                present_complete_semaphores,
-                rendering_complete_semaphores,
-                draw_commands_reuse_fences,
+                present_complete_semaphore,
+                rendering_complete_semaphore,
+                draw_commands_reuse_fence,
+                setup_commands_reuse_fence,
                 surface,
                 debug_call_back,
                 debug_utils_loader,
@@ -589,19 +558,18 @@ impl Drop for ExampleBase {
     fn drop(&mut self) {
         unsafe {
             self.device.device_wait_idle().unwrap();
-            for &semaphore in &self.present_complete_semaphores {
-                self.device.destroy_semaphore(semaphore, None);
-            }
-            for &semaphore in &self.rendering_complete_semaphores {
-                self.device.destroy_semaphore(semaphore, None);
-            }
-            for &fence in &self.draw_commands_reuse_fences {
-                self.device.destroy_fence(fence, None);
-            }
+            self.device
+                .destroy_semaphore(self.present_complete_semaphore, None);
+            self.device
+                .destroy_semaphore(self.rendering_complete_semaphore, None);
+            self.device
+                .destroy_fence(self.draw_commands_reuse_fence, None);
+            self.device
+                .destroy_fence(self.setup_commands_reuse_fence, None);
             self.device.free_memory(self.depth_image_memory, None);
             self.device.destroy_image_view(self.depth_image_view, None);
             self.device.destroy_image(self.depth_image, None);
-            for &image_view in &self.present_image_views {
+            for &image_view in self.present_image_views.iter() {
                 self.device.destroy_image_view(image_view, None);
             }
             self.device.destroy_command_pool(self.pool, None);
@@ -616,13 +584,7 @@ impl Drop for ExampleBase {
     }
 }
 
-#[derive(Clone, Debug, Copy)]
-struct Vertex {
-    pos: [f32; 4],
-    color: [f32; 4],
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
+pub fn vk() -> Result<(), Box<dyn Error>> {
     unsafe {
         let base = ExampleBase::new(1920, 1080)?;
         let renderpass_attachments = [
@@ -695,7 +657,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let index_buffer_data = [0u32, 1, 2];
         let index_buffer_info = vk::BufferCreateInfo::default()
-            .size(size_of_val(&index_buffer_data) as u64)
+            .size(mem::size_of_val(&index_buffer_data) as u64)
             .usage(vk::BufferUsageFlags::INDEX_BUFFER)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
@@ -728,7 +690,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .unwrap();
         let mut index_slice = Align::new(
             index_ptr,
-            align_of::<u32>() as u64,
+            mem::align_of::<u32>() as u64,
             index_buffer_memory_req.size,
         );
         index_slice.copy_from_slice(&index_buffer_data);
@@ -738,7 +700,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .unwrap();
 
         let vertex_input_buffer_info = vk::BufferCreateInfo {
-            size: 3 * size_of::<Vertex>() as u64,
+            size: 100,
             usage: vk::BufferUsageFlags::VERTEX_BUFFER,
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             ..Default::default()
@@ -771,21 +733,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             .allocate_memory(&vertex_buffer_allocate_info, None)
             .unwrap();
 
-        let vertices = [
-            Vertex {
-                pos: [-1.0, 1.0, 0.0, 1.0],
-                color: [0.0, 1.0, 0.0, 1.0],
-            },
-            Vertex {
-                pos: [1.0, 1.0, 0.0, 1.0],
-                color: [0.0, 0.0, 1.0, 1.0],
-            },
-            Vertex {
-                pos: [0.0, -1.0, 0.0, 1.0],
-                color: [1.0, 0.0, 0.0, 1.0],
-            },
-        ];
-
         let vert_ptr = base
             .device
             .map_memory(
@@ -796,141 +743,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             )
             .unwrap();
 
-        let mut vert_align = Align::new(
-            vert_ptr,
-            align_of::<Vertex>() as u64,
-            vertex_input_buffer_memory_req.size,
-        );
-        vert_align.copy_from_slice(&vertices);
-        base.device.unmap_memory(vertex_input_buffer_memory);
-        base.device
-            .bind_buffer_memory(vertex_input_buffer, vertex_input_buffer_memory, 0)
-            .unwrap();
-
-        let viewports = [vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: base.surface_resolution.width as f32,
-            height: base.surface_resolution.height as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        }];
-        let scissors = [base.surface_resolution.into()];
-        let viewport_state_info = vk::PipelineViewportStateCreateInfo::default()
-            .scissors(&scissors)
-            .viewports(&viewports);
-
-        let rasterization_info = vk::PipelineRasterizationStateCreateInfo {
-            front_face: vk::FrontFace::COUNTER_CLOCKWISE,
-            line_width: 1.0,
-            polygon_mode: vk::PolygonMode::FILL,
-            ..Default::default()
-        };
-        let multisample_state_info = vk::PipelineMultisampleStateCreateInfo {
-            rasterization_samples: vk::SampleCountFlags::TYPE_1,
-            ..Default::default()
-        };
-        let noop_stencil_state = vk::StencilOpState {
-            fail_op: vk::StencilOp::KEEP,
-            pass_op: vk::StencilOp::KEEP,
-            depth_fail_op: vk::StencilOp::KEEP,
-            compare_op: vk::CompareOp::ALWAYS,
-            ..Default::default()
-        };
-        let depth_state_info = vk::PipelineDepthStencilStateCreateInfo {
-            depth_test_enable: 1,
-            depth_write_enable: 1,
-            depth_compare_op: vk::CompareOp::LESS_OR_EQUAL,
-            front: noop_stencil_state,
-            back: noop_stencil_state,
-            max_depth_bounds: 1.0,
-            ..Default::default()
-        };
-        let color_blend_attachment_states = [vk::PipelineColorBlendAttachmentState {
-            blend_enable: 0,
-            src_color_blend_factor: vk::BlendFactor::SRC_COLOR,
-            dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_DST_COLOR,
-            color_blend_op: vk::BlendOp::ADD,
-            src_alpha_blend_factor: vk::BlendFactor::ZERO,
-            dst_alpha_blend_factor: vk::BlendFactor::ZERO,
-            alpha_blend_op: vk::BlendOp::ADD,
-            color_write_mask: vk::ColorComponentFlags::RGBA,
-        }];
-        let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
-            .logic_op(vk::LogicOp::CLEAR)
-            .attachments(&color_blend_attachment_states);
-
-        let dynamic_state = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic_state_info =
-            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_state);
-
-        let graphic_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-            .stages(&shader_stage_create_infos)
-            .vertex_input_state(&vertex_input_state_info)
-            .input_assembly_state(&vertex_input_assembly_state_info)
-            .viewport_state(&viewport_state_info)
-            .rasterization_state(&rasterization_info)
-            .multisample_state(&multisample_state_info)
-            .depth_stencil_state(&depth_state_info)
-            .color_blend_state(&color_blend_state)
-            .dynamic_state(&dynamic_state_info)
-            .layout(pipeline_layout)
-            .render_pass(renderpass);
-
-        let graphics_pipelines = base
-            .device
-            .create_graphics_pipelines(vk::PipelineCache::null(), &[graphic_pipeline_info], None)
-            .expect("Unable to create graphics pipeline");
-
-        let graphic_pipeline = graphics_pipelines[0];
-
-        let _ = base.render_loop(|frame_index| {
-            let present_complete_semaphore =
-                base.present_complete_semaphores[frame_index % MAX_FRAME_LATENCY];
-            let draw_commands_reuse_fence =
-                base.draw_commands_reuse_fences[frame_index % MAX_FRAME_LATENCY];
-            let draw_command_buffer = base.draw_command_buffers[frame_index % MAX_FRAME_LATENCY];
-
+        let _ = base.render_loop(|| {
             let (present_index, _) = base
                 .swapchain_loader
                 .acquire_next_image(
                     base.swapchain,
-                    u64::MAX,
-                    present_complete_semaphore,
+                    std::u64::MAX,
+                    base.present_complete_semaphore,
                     vk::Fence::null(),
                 )
                 .unwrap();
-            let clear_values = [
-                vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 0.0],
-                    },
-                },
-                vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                },
-            ];
 
-            let rendering_complete_semaphore =
-                base.rendering_complete_semaphores[present_index as usize];
-
-            let render_pass_begin_info = vk::RenderPassBeginInfo::default()
-                .render_pass(renderpass)
-                .framebuffer(framebuffers[present_index as usize])
-                .render_area(base.surface_resolution.into())
-                .clear_values(&clear_values);
-
-            record_submit_commandbuffer(
+            /*record_submit_commandbuffer(
                 &base.device,
-                draw_command_buffer,
-                draw_commands_reuse_fence,
+                base.draw_command_buffer,
+                base.draw_commands_reuse_fence,
                 base.present_queue,
                 &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT],
-                &[present_complete_semaphore],
-                &[rendering_complete_semaphore],
+                &[base.present_complete_semaphore],
+                &[base.rendering_complete_semaphore],
                 |device, draw_command_buffer| {
                     device.cmd_begin_render_pass(
                         draw_command_buffer,
@@ -968,12 +799,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     // device.cmd_draw(draw_command_buffer, 3, 1, 0, 0);
                     device.cmd_end_render_pass(draw_command_buffer);
                 },
-            );
-            let wait_semaphores = [rendering_complete_semaphore];
+            );*/
+            let wait_semaphors = [base.rendering_complete_semaphore];
             let swapchains = [base.swapchain];
             let image_indices = [present_index];
             let present_info = vk::PresentInfoKHR::default()
-                .wait_semaphores(&wait_semaphores)
+                // .wait_semaphores(&wait_semaphors) // &base.rendering_complete_semaphore)
                 .swapchains(&swapchains)
                 .image_indices(&image_indices);
 
@@ -983,14 +814,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         });
 
         base.device.device_wait_idle().unwrap();
-        for pipeline in graphics_pipelines {
-            base.device.destroy_pipeline(pipeline, None);
-        }
-        base.device.destroy_pipeline_layout(pipeline_layout, None);
-        base.device
-            .destroy_shader_module(vertex_shader_module, None);
-        base.device
-            .destroy_shader_module(fragment_shader_module, None);
         base.device.free_memory(index_buffer_memory, None);
         base.device.destroy_buffer(index_buffer, None);
         base.device.free_memory(vertex_input_buffer_memory, None);

@@ -103,6 +103,8 @@ fn main() {
     let height: u32 = 100;
     let size = width * height;
 
+    vk::vk().unwrap();
+
     unsafe {
         println!("Set device {}", args.device_index);
         let result = hipSetDevice(args.device_index);
