@@ -1,0 +1,19 @@
+[package]
+name = "gpu"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[profile.dev]
+lto = true
+[profile.release]
+lto = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+amdgpu-device-libs-build = "0.1"
+
+[dependencies]
+amdgpu-device-libs = "0.1"

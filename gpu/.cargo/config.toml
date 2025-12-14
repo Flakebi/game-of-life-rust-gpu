@@ -1,0 +1,6 @@
+[build]
+target = "amdgcn-amd-amdhsa"
+rustflags = ["-Clinker-plugin-lto"]
+
+[unstable]
+build-std = ["core", "alloc"]
