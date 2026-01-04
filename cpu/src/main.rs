@@ -103,7 +103,9 @@ fn main() {
     let height: u32 = 100;
     let size = width * height;
 
-    vk::vk().unwrap();
+    let win = vk::Vk::new(1920, 1000).unwrap();
+    win.render_loop2(|| {}).unwrap();
+    win.clear();
 
     unsafe {
         println!("Set device {}", args.device_index);
