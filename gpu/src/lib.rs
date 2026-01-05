@@ -11,88 +11,151 @@
 
 extern crate alloc;
 
-use core::sync::atomic::AtomicU32;
-use core::sync::atomic::Ordering;
-
 use amdgpu_device_libs::prelude::*;
 
 #[derive(Clone, Copy)]
 #[repr(simd)]
-pub struct BufDesc([u32; 4]);
+pub struct ImageDesc([u32; 8]);
+
+#[derive(Clone, Copy)]
+#[repr(simd)]
+pub struct SamplerDesc([u32; 4]);
+
+#[derive(Clone, Copy)]
+#[repr(simd)]
+pub struct RGBA([f32; 4]);
+
+unsafe extern "C" {
+    safe fn __amdgpu_util_kernarg_segment_ptr() -> *const core::ffi::c_void;
+}
 
 #[allow(improper_ctypes)]
 unsafe extern "unadjusted" {
-    /// Returns the x coordinate of the workitem index within the workgroup.
-    #[link_name = "llvm.amdgcn.struct.buffer.load"]
-    pub fn struct_buffer_load_u8(
-        buf: BufDesc,
-        index: u32,
-        offset: u32,
-        soffset: u32,
-        cache_policy: u32,
-    ) -> u8;
+    #[link_name = "llvm.amdgcn.image.sample.lz.2d.f32.f32"]
+    pub fn image_sample(
+        dmask: u32,
+        x: f32,
+        y: f32,
+        img: ImageDesc,
+        samp: SamplerDesc,
+        unorm: bool,
+        tfe: u32,
+        aux: u32,
+    ) -> f32;
+
+    #[link_name = "llvm.amdgcn.image.store.2d.f32.i32"]
+    pub fn image_store(data: f32, dmask: u32, x: u32, y: u32, img: ImageDesc, tfe: u32, aux: u32);
+
+    #[link_name = "llvm.amdgcn.image.store.2d.v4f32.i32"]
+    pub fn image_store_color(
+        data: RGBA,
+        dmask: u32,
+        x: u32,
+        y: u32,
+        img: ImageDesc,
+        tfe: u32,
+        aux: u32,
+    );
+}
+
+#[allow(dead_code)]
+struct KernelArgs {
+    old_content_desc: ImageDesc,
+    new_content_desc: ImageDesc,
+    present_desc: ImageDesc,
+    sampler: SamplerDesc,
+    width: u32,
+    height: u32,
 }
 
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn kernel(
-    input: *const u8,
-    output: *mut u32,
+    /*_: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+
+    _: u32,
+    _: u32,*/
+    old_content_desc: ImageDesc,
+    new_content_desc: ImageDesc,
+    present_desc: ImageDesc,
+    sampler: SamplerDesc,
     width: u32,
     height: u32,
+    screen_width: u32,
+    screen_height: u32,
 ) {
+    // let args: &KernelArgs = unsafe { &*(__amdgpu_util_kernarg_segment_ptr() as *const _) };
     let dispatch = dispatch_ptr();
 
     // Compute global coordinates
     let x = workgroup_id_x() * dispatch.workgroup_size_x as u32 + workitem_id_x();
     let y = workgroup_id_y() * dispatch.workgroup_size_y as u32 + workitem_id_y();
 
+    if x == 0 && y == 0 {
+        // println!("Is running with {}x{}", screen_width, screen_height);
+    }
+
+    // if x >= args.width || y >= args.height {
     if x >= width || y >= height {
         return;
     }
 
-    // Build a structured buffer descriptor that takes y coordinate as index and x as offset
-    let mut desc = [0u32; 4];
-    // addr
-    desc[0] = input as usize as u32;
-    // addr, stride
-    desc[1] = (((input as usize) >> 32) as u32) | ((width + 1) << 16);
-    // num records
-    desc[2] = height;
-    // dst_sel, format = 32_UINT, oob_select = 0 (check index and offset)
-    desc[3] = 4 | (5 << 3) | (6 << 6) | (7 << 9) | (20 << 12) | (1 << 24);
-    let desc = BufDesc(desc);
-    // Read at coordinate, returns 0 if out of bounds
-    let load = |x, y| unsafe { struct_buffer_load_u8(desc, y, x, 0, 0) };
+    unsafe {
+        let x_f = x as f32 / width as f32;
+        let y_f = y as f32 / height as f32;
+        let val = image_sample(1, x_f, y_f, old_content_desc, sampler, false, 0, 0);
+        image_store(val, 1, x, y, new_content_desc, 0, 0);
 
-    let atomic = unsafe { AtomicU32::from_ptr(output) };
-    if load(x, y) == b'@' {
-        let roll_num = |x, y| {
-            if load(x, y) == b'@' { 1 } else { 0 }
-        };
-        let mut set_neighbors = 0;
-        // Loop does not get unrolled for some reason
-        /*for dx in -1..=1 {
-            for dy in -1..=1 {
-                if !(dx == 0 && dy == 0) {
-                    set_neighbors += roll_num(x.wrapping_add_signed(dx), y.wrapping_add_signed(dy));
-                }
-            }
+        // Write screen image
+        let x_screen = (x_f * screen_width as f32) as u32;
+        let next_x_screen = (((x + 1) as f32 / width as f32) * screen_width as f32) as u32;
+        let y_screen = (y_f * screen_height as f32) as u32;
+        let next_y_screen = (((y + 1) as f32 / height as f32) * screen_height as f32) as u32;
+
+        /*if x == 0 && y == 0 {
+            println!(
+                "Write {val} to {x_screen}..{next_x_screen} x {y_screen}..{next_y_screen} ({width}x{height} to {screen_width}x{screen_height})"
+            );
         }*/
-
-        set_neighbors += roll_num(x.wrapping_add_signed(-1), y.wrapping_add_signed(-1));
-        set_neighbors += roll_num(x.wrapping_add_signed(-1), y.wrapping_add_signed(0));
-        set_neighbors += roll_num(x.wrapping_add_signed(-1), y.wrapping_add_signed(1));
-
-        set_neighbors += roll_num(x.wrapping_add_signed(0), y.wrapping_add_signed(-1));
-        set_neighbors += roll_num(x.wrapping_add_signed(0), y.wrapping_add_signed(1));
-
-        set_neighbors += roll_num(x.wrapping_add_signed(1), y.wrapping_add_signed(-1));
-        set_neighbors += roll_num(x.wrapping_add_signed(1), y.wrapping_add_signed(0));
-        set_neighbors += roll_num(x.wrapping_add_signed(1), y.wrapping_add_signed(1));
-
-        if set_neighbors < 4 {
-            atomic.fetch_add(1, Ordering::Relaxed);
+        for i in x_screen..next_x_screen {
+            for j in y_screen..next_y_screen {
+                let col = if val == 0.0 {
+                    RGBA([0.0, 0.0, 0.0, 1.0])
+                } else {
+                    RGBA([0.2, 0.2, 1.0, 1.0])
+                };
+                image_store_color(col, 0xf, i, j, present_desc, 0, 0);
+            }
         }
     }
 }

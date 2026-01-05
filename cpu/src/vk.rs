@@ -1,14 +1,12 @@
 use std::default::Default;
 use std::error::Error;
 use std::ffi;
-use std::mem;
 use std::{borrow::Cow, cell::RefCell, ops::Drop, os::raw::c_char};
 
-use ash::util::*;
 use ash::vk;
 use ash::{
     Device, Entry, Instance,
-    ext::debug_utils,
+    ext::{debug_utils, descriptor_buffer},
     khr::{surface, swapchain},
 };
 use winit::{
@@ -141,10 +139,13 @@ pub struct Vk {
     pub swapchain: vk::SwapchainKHR,
     pub present_images: Vec<vk::Image>,
     pub present_image_views: Vec<vk::ImageView>,
+    pub present_image_descriptors: Vec<[u8; 32]>,
 
     // Images containing game of life
     pub content_images: Vec<vk::Image>,
     pub content_image_views: Vec<vk::ImageView>,
+    pub content_image_descriptors: Vec<[u8; 32]>,
+    pub content_image_sampler: [u8; 16],
 
     pub pool: vk::CommandPool,
     pub draw_command_buffer: vk::CommandBuffer,
@@ -158,7 +159,7 @@ pub struct Vk {
 }
 
 impl Vk {
-    pub fn render_loop<F: Fn()>(&self, f: F) -> Result<(), impl Error> {
+    pub fn render_loop<'a, F: Fn() + 'a>(&'a self, f: F) -> Result<(), impl Error> {
         self.event_loop.borrow_mut().run_on_demand(|event, elwp| {
             elwp.set_control_flow(ControlFlow::Poll);
             match event {
@@ -217,7 +218,7 @@ impl Vk {
                 .application_version(0)
                 .engine_name(app_name)
                 .engine_version(0)
-                .api_version(vk::make_api_version(0, 1, 0, 0));
+                .api_version(vk::make_api_version(0, 1, 4, 0));
 
             let create_flags = vk::InstanceCreateFlags::default();
 
@@ -286,7 +287,14 @@ impl Vk {
                 })
                 .expect("Couldn't find suitable device.");
             let queue_family_index = queue_family_index as u32;
-            let device_extension_names_raw = [swapchain::NAME.as_ptr()];
+            let device_extension_names_raw = [
+                swapchain::NAME.as_ptr(),
+                ash::khr::buffer_device_address::NAME.as_ptr(),
+                ash::ext::descriptor_indexing::NAME.as_ptr(),
+                ash::khr::synchronization2::NAME.as_ptr(),
+                descriptor_buffer::NAME.as_ptr(),
+            ];
+
             let features = vk::PhysicalDeviceFeatures {
                 shader_clip_distance: 1,
                 ..Default::default()
@@ -406,17 +414,37 @@ impl Vk {
                 })
                 .collect();
 
+            let device_memory_properties = instance.get_physical_device_memory_properties(pdevice);
+            let get_descriptor_device = descriptor_buffer::Device::new(&instance, &device);
+
+            let present_image_descriptors = present_image_views
+                .iter()
+                .map(|&image| {
+                    let ii = vk::DescriptorImageInfo::default()
+                        .image_view(image)
+                        .image_layout(vk::ImageLayout::GENERAL);
+                    let info = vk::DescriptorGetInfoEXT::default()
+                        .ty(vk::DescriptorType::STORAGE_IMAGE)
+                        .data(vk::DescriptorDataEXT {
+                            p_storage_image: &ii as *const _,
+                        });
+                    let mut data = [0u8; 32];
+                    get_descriptor_device.get_descriptor(&info, &mut data);
+                    data
+                })
+                .collect();
+
             let content_images = (0..2)
                 .into_iter()
                 .map(|_| {
                     let info = vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_3D)
+                        .image_type(vk::ImageType::TYPE_2D)
                         .extent(vk::Extent3D::default().width(100).height(100).depth(1))
                         .mip_levels(1)
                         .array_layers(1)
                         .format(vk::Format::R8_UINT)
                         .tiling(vk::ImageTiling::OPTIMAL)
-                        .initial_layout(vk::ImageLayout::GENERAL)
+                        .initial_layout(vk::ImageLayout::UNDEFINED)
                         .usage(vk::ImageUsageFlags::STORAGE)
                         .sharing_mode(vk::SharingMode::EXCLUSIVE)
                         .samples(vk::SampleCountFlags::TYPE_1);
@@ -424,24 +452,18 @@ impl Vk {
                 })
                 .collect::<Vec<_>>();
 
-            let device_memory_properties = instance.get_physical_device_memory_properties(pdevice);
-
-            let find_memory_type = |bits| {
-                for i in 0..device_memory_properties.memory_type_count {
-                    if ((1 << i) & bits) != 0 {
-                        return i;
-                    }
-                }
-                panic!("Failed to find memory type matching {bits}");
-            };
-
             for image in &content_images {
-                let info = vk::ImageMemoryRequirementsInfo2::default().image(*image);
-                let mut reqs = Default::default();
-                device.get_image_memory_requirements2(&info, &mut reqs);
+                let reqs = device.get_image_memory_requirements(*image);
                 let alloc_info = vk::MemoryAllocateInfo::default()
-                    .allocation_size(reqs.memory_requirements.size)
-                    .memory_type_index(find_memory_type(reqs.memory_requirements.memory_type_bits));
+                    .allocation_size(reqs.size)
+                    .memory_type_index(
+                        find_memorytype_index(
+                            &reqs,
+                            &device_memory_properties,
+                            vk::MemoryPropertyFlags::empty(),
+                        )
+                        .expect("Failed to find memory type"),
+                    );
                 let memory = device.allocate_memory(&alloc_info, None).unwrap();
                 device.bind_image_memory(*image, memory, 0).unwrap();
             }
@@ -469,6 +491,49 @@ impl Vk {
                     device.create_image_view(&create_view_info, None).unwrap()
                 })
                 .collect();
+
+            let content_image_descriptors = content_image_views
+                .iter()
+                .map(|&image| {
+                    let ii = vk::DescriptorImageInfo::default()
+                        .image_view(image)
+                        .image_layout(vk::ImageLayout::GENERAL);
+                    let info = vk::DescriptorGetInfoEXT::default()
+                        .ty(vk::DescriptorType::STORAGE_IMAGE)
+                        .data(vk::DescriptorDataEXT {
+                            p_storage_image: &ii as *const _,
+                        });
+                    let mut data = [0u8; 32];
+                    get_descriptor_device.get_descriptor(&info, &mut data);
+                    data
+                })
+                .collect();
+
+            let content_image_sampler = {
+                let sampler_info = vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::NEAREST)
+                    .min_filter(vk::Filter::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_w(vk::SamplerAddressMode::REPEAT)
+                    .unnormalized_coordinates(false)
+                    .compare_enable(false)
+                    .compare_op(vk::CompareOp::ALWAYS)
+                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                    .mip_lod_bias(0.0)
+                    .min_lod(0.0)
+                    .max_lod(0.0);
+                let sampler = device.create_sampler(&sampler_info, None).unwrap();
+
+                let info = vk::DescriptorGetInfoEXT::default()
+                    .ty(vk::DescriptorType::SAMPLER)
+                    .data(vk::DescriptorDataEXT {
+                        p_sampler: &sampler as *const _,
+                    });
+                let mut data = [0u8; 16];
+                get_descriptor_device.get_descriptor(&info, &mut data);
+                data
+            };
 
             let fence_create_info =
                 vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
@@ -506,8 +571,11 @@ impl Vk {
                 swapchain,
                 present_images,
                 present_image_views,
+                present_image_descriptors,
                 content_images,
                 content_image_views,
+                content_image_descriptors,
+                content_image_sampler,
                 pool,
                 draw_command_buffer,
                 setup_command_buffer,
@@ -522,9 +590,9 @@ impl Vk {
         }
     }
 
-    pub fn render_loop2<F: Fn()>(&self, f: F) -> Result<(), impl Error> {
+    pub fn render_loop2<'a, F: Fn(u32) + 'a>(&'a self, f: F) -> Result<(), impl Error> {
         unsafe {
-            self.render_loop(|| {
+            self.render_loop(move || {
                 let (present_index, _suboptimal) = self
                     .swapchain_loader
                     .acquire_next_image(
@@ -534,6 +602,7 @@ impl Vk {
                         vk::Fence::null(),
                     )
                     .unwrap();
+                f(present_index);
 
                 /*record_submit_commandbuffer(
                     &self.device,

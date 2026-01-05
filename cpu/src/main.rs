@@ -101,11 +101,11 @@ fn main() {
 
     let width: u32 = 100;
     let height: u32 = 100;
+    let screen_width: u32 = 1920;
+    let screen_height: u32 = 1000;
     let size = width * height;
 
-    let win = vk::Vk::new(1920, 1000).unwrap();
-    win.render_loop2(|| {}).unwrap();
-    win.clear();
+    let win = vk::Vk::new(screen_width, screen_height).unwrap();
 
     unsafe {
         println!("Set device {}", args.device_index);
@@ -152,51 +152,70 @@ fn main() {
         // Pass two pointers, input_device and output_device
         #[allow(dead_code)]
         struct KernelArgs {
-            input: *mut c_void,
-            output: *mut c_void,
+            old_content_desc: [u8; 32],
+            new_content_desc: [u8; 32],
+            present_desc: [u8; 32],
+            sampler: [u8; 16],
             width: u32,
             height: u32,
+            screen_width: u32,
+            screen_height: u32,
         }
-        let kernel_args: &mut KernelArgs = &mut KernelArgs {
-            input: a_device,
-            output: b_device,
-            width,
-            height,
-        };
-        let mut size = std::mem::size_of_val(kernel_args);
 
-        #[allow(clippy::manual_dangling_ptr)]
-        let mut config = [
-            0x1 as *mut c_void,                          // Next come arguments
-            kernel_args as *mut _ as *mut c_void,        // Pointer to arguments
-            0x2 as *mut c_void,                          // Next comes size
-            std::ptr::addr_of_mut!(size) as *mut c_void, // Pointer to size of arguments
-            0x3 as *mut c_void,                          // End
-        ];
+        win.render_loop2(|i| {
+            let present_desc = win.present_image_descriptors[i as usize];
+            let old_content_desc = win.content_image_descriptors[((i + 1) % 2) as usize];
+            let new_content_desc = win.content_image_descriptors[(i % 2) as usize];
+            let sampler = win.content_image_sampler;
 
-        const WG_SIZE: u32 = 16;
-        // Launch two workgroups (2x1x1), each of the size 16x16x1
-        let wg_x = width.div_ceil(WG_SIZE);
-        let wg_y = height.div_ceil(WG_SIZE);
-        println!("Launch {} {wg_x}x{wg_y}x1", args.kernel);
-        let result = hipModuleLaunchKernel(
-            function,
-            wg_x,                 // Workgroup count x
-            wg_y,                 // Workgroup count y
-            1,                    // Workgroup count z
-            WG_SIZE,              // Workgroup dim x
-            WG_SIZE,              // Workgroup dim y
-            1,                    // Workgroup dim z
-            0,                    // sharedMemBytes for extern shared variables
-            std::ptr::null_mut(), // stream
-            std::ptr::null_mut(), // params (unimplemented in hip)
-            config.as_mut_ptr(),  // arguments
-        );
-        assert_eq!(result, hipError_t::hipSuccess);
+            let width = 100;
+            let height = 100;
+            let kernel_args: &mut KernelArgs = &mut KernelArgs {
+                old_content_desc,
+                new_content_desc,
+                present_desc,
+                sampler,
+                width,
+                height,
+                screen_width,
+                screen_height,
+            };
+            let mut size = std::mem::size_of_val(kernel_args);
 
-        println!("Wait for finish");
-        let result = hipDeviceSynchronize();
-        assert_eq!(result, hipError_t::hipSuccess);
+            #[allow(clippy::manual_dangling_ptr)]
+            let mut config = [
+                0x1 as *mut c_void,                          // Next come arguments
+                kernel_args as *mut _ as *mut c_void,        // Pointer to arguments
+                0x2 as *mut c_void,                          // Next comes size
+                std::ptr::addr_of_mut!(size) as *mut c_void, // Pointer to size of arguments
+                0x3 as *mut c_void,                          // End
+            ];
+
+            const WG_SIZE: u32 = 16;
+            // Launch two workgroups (2x1x1), each of the size 16x16x1
+            let wg_x = width.div_ceil(WG_SIZE);
+            let wg_y = height.div_ceil(WG_SIZE);
+            println!("Launch {} {wg_x}x{wg_y}x1", args.kernel);
+            let result = hipModuleLaunchKernel(
+                function,
+                wg_x,                 // Workgroup count x
+                wg_y,                 // Workgroup count y
+                1,                    // Workgroup count z
+                WG_SIZE,              // Workgroup dim x
+                WG_SIZE,              // Workgroup dim y
+                1,                    // Workgroup dim z
+                0,                    // sharedMemBytes for extern shared variables
+                std::ptr::null_mut(), // stream
+                std::ptr::null_mut(), // params (unimplemented in hip)
+                config.as_mut_ptr(),  // arguments
+            );
+            assert_eq!(result, hipError_t::hipSuccess);
+
+            println!("Wait for finish");
+            let result = hipDeviceSynchronize();
+            assert_eq!(result, hipError_t::hipSuccess);
+        })
+        .unwrap();
 
         /*println!("Copy memory back");
         let result = hipMemcpyDtoH(
@@ -217,6 +236,7 @@ fn main() {
         let result = hipFree(b_device);
         assert_eq!(result, hipError_t::hipSuccess);
 
+        win.clear();
         println!("Finished");
     }
 }
