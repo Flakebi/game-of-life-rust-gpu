@@ -41,6 +41,17 @@ fn get_str(s: &[i8]) -> &str {
     cs.to_str().unwrap()
 }
 
+struct App {
+    i: u32,
+    paused: bool,
+    module: hipModule_t,
+    function: hipFunction_t,
+    set: hipFunction_t,
+    check: hipFunction_t,
+    // Presset buttons and associated value (set or unset)
+    is_pressed: HashMap<Option<DeviceId>, bool>,
+}
+
 fn main() {
     // Parse arguments
     let args = Cli::parse();
@@ -102,15 +113,9 @@ fn main() {
         );
     }
 
-    let width: u32 = 100;
-    let height: u32 = 100;
-    let screen_width: u32 = 1920;
-    let screen_height: u32 = 1000;
-    let size = width * height;
-
     let app = vk::App::new(
-        screen_width,
-        screen_height,
+        1000,
+        800,
         Box::new(move |win| {
             unsafe {
                 println!("Set device {}", args.device_index);
@@ -121,7 +126,7 @@ fn main() {
                 assert_eq!(result, hipError_t::hipSuccess);
 
                 // Allocate two buffers on the GPU for double buffering
-                println!("Alloc memory");
+                /*println!("Alloc memory");
                 let mut a_device: hipDeviceptr_t = std::ptr::null_mut();
                 let mut b_device: hipDeviceptr_t = std::ptr::null_mut();
                 let result = hipMalloc(&mut a_device, size as usize);
@@ -137,7 +142,7 @@ fn main() {
                     a_device
                 );
                 let result = hipMemcpyHtoD(a_device, a.as_mut_ptr() as *mut c_void, size as usize);
-                assert_eq!(result, hipError_t::hipSuccess);
+                assert_eq!(result, hipError_t::hipSuccess);*/
 
                 // Load the executable that was compiled for the GPU
                 println!("Load module from {}", args.file.display());
@@ -175,11 +180,12 @@ fn main() {
                     hipModuleGetFunction(&mut clear, module, b"clear\0".as_ptr() as *const _);
                 assert_eq!(result, hipError_t::hipSuccess);
 
-                for image in &win.content_image_descriptors {
+                let swapchain = win.swapchain.as_ref().unwrap();
+                for image in &swapchain.content_image_descriptors {
                     let kernel_args = &mut ClearKernelArgs {
                         image_desc: *image,
-                        width,
-                        height,
+                        width: swapchain.width,
+                        height: swapchain.height,
                     };
                     let mut size = std::mem::size_of_val(kernel_args);
 
@@ -194,8 +200,8 @@ fn main() {
 
                     const WG_SIZE: u32 = 16;
                     // Launch two workgroups (2x1x1), each of the size 16x16x1
-                    let wg_x = width.div_ceil(WG_SIZE);
-                    let wg_y = height.div_ceil(WG_SIZE);
+                    let wg_x = swapchain.width.div_ceil(WG_SIZE);
+                    let wg_y = swapchain.height.div_ceil(WG_SIZE);
                     let result = hipModuleLaunchKernel(
                         clear,
                         wg_x,                 // Workgroup count x
@@ -225,15 +231,9 @@ fn main() {
                     hipModuleGetFunction(&mut check, module, b"check\0".as_ptr() as *const _);
                 assert_eq!(result, hipError_t::hipSuccess);
 
-                let width = 100;
-                let height = 100;
                 Box::new(App {
                     i: 0,
                     paused: false,
-                    width,
-                    height,
-                    screen_width,
-                    screen_height,
                     module,
                     function,
                     set,
@@ -246,28 +246,22 @@ fn main() {
     app.run().unwrap();
 }
 
-struct App {
-    i: u32,
-    paused: bool,
-    width: u32,
-    height: u32,
-    screen_width: u32,
-    screen_height: u32,
-    module: hipModule_t,
-    function: hipFunction_t,
-    set: hipFunction_t,
-    check: hipFunction_t,
-    // Presset buttons and associated value (set or unset)
-    is_pressed: HashMap<Option<DeviceId>, bool>,
-}
-
 impl App {
     // x and y are screen coordinates
     fn set(&mut self, screen_x: f64, screen_y: f64, set: bool, win: &vk::Vk) {
         // Screen to data coordinates
-        let x = (screen_x as f32 / self.screen_width as f32 * self.width as f32) as u32;
-        let y = (screen_y as f32 / self.screen_height as f32 * self.height as f32) as u32;
-        println!("Set {screen_x},{screen_y} → {x},{y} = {set:?}");
+        let swapchain = win.swapchain.as_ref().unwrap();
+        let x = (screen_x as f32 / swapchain.surface_resolution.width as f32
+            * swapchain.width as f32) as u32;
+        let y = (screen_y as f32 / swapchain.surface_resolution.height as f32
+            * swapchain.height as f32) as u32;
+        /*println!(
+            "Set {screen_x},{screen_y} (of {},{}) → {x},{y} (of {},{}) = {set:?}",
+            swapchain.surface_resolution.width,
+            swapchain.surface_resolution.height,
+            swapchain.width,
+            swapchain.height
+        );*/
 
         unsafe {
             #[allow(dead_code)]
@@ -279,7 +273,7 @@ impl App {
             }
 
             let i = if self.paused { self.i ^ 1 } else { self.i };
-            let img = win.content_image_descriptors[i as usize];
+            let img = win.swapchain.as_ref().unwrap().content_image_descriptors[i as usize];
             let kernel_args = &mut KernelArgs {
                 img,
                 x,
@@ -333,15 +327,16 @@ impl App {
                 val: f32,
             }
 
-            let img = win.content_image_descriptors[(self.i ^ 1) as usize];
+            let swapchain = win.swapchain.as_ref().unwrap();
+            let img = swapchain.content_image_descriptors[(self.i ^ 1) as usize];
             let sampler = win.content_image_sampler;
             let kernel_args = &mut KernelArgs {
                 img,
                 sampler,
                 x,
                 y,
-                width: self.width,
-                height: self.height,
+                width: swapchain.width,
+                height: swapchain.height,
                 val: if set { 1.0 } else { 0.0 },
             };
             let mut size = std::mem::size_of_val(kernel_args);
@@ -386,9 +381,10 @@ impl vk::MyApp for App {
                 self.i ^= 1;
             }
             // TODO Write directly to screen image
-            let screen_desc = win.screen_image_descriptor;
-            let old_content_desc = win.content_image_descriptors[(self.i ^ 1) as usize];
-            let new_content_desc = win.content_image_descriptors[self.i as usize];
+            let swapchain = win.swapchain.as_ref().unwrap();
+            let screen_desc = swapchain.screen_image_descriptor;
+            let old_content_desc = swapchain.content_image_descriptors[(self.i ^ 1) as usize];
+            let new_content_desc = swapchain.content_image_descriptors[self.i as usize];
             let sampler = win.content_image_sampler;
 
             #[allow(dead_code)]
@@ -399,8 +395,8 @@ impl vk::MyApp for App {
                 sampler: [u8; 16],
                 width: u32,
                 height: u32,
-                screen_width: u32,
-                screen_height: u32,
+                window_width: u32,
+                window_height: u32,
                 paused: u32,
             }
 
@@ -409,10 +405,10 @@ impl vk::MyApp for App {
                 new_content_desc,
                 screen_desc,
                 sampler,
-                width: self.width,
-                height: self.height,
-                screen_width: self.screen_width,
-                screen_height: self.screen_height,
+                width: swapchain.width,
+                height: swapchain.height,
+                window_width: swapchain.surface_resolution.width,
+                window_height: swapchain.surface_resolution.height,
                 paused: if self.paused { 1 } else { 0 },
             };
             let mut size = std::mem::size_of_val(kernel_args);
@@ -428,8 +424,8 @@ impl vk::MyApp for App {
 
             const WG_SIZE: u32 = 16;
             // Launch two workgroups (2x1x1), each of the size 16x16x1
-            let wg_x = self.width.div_ceil(WG_SIZE);
-            let wg_y = self.height.div_ceil(WG_SIZE);
+            let wg_x = swapchain.width.div_ceil(WG_SIZE);
+            let wg_y = swapchain.height.div_ceil(WG_SIZE);
             // println!("Launch {} {wg_x}x{wg_y}x1", args.kernel);
             let result = hipModuleLaunchKernel(
                 self.function,

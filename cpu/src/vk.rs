@@ -60,13 +60,15 @@ impl ApplicationHandler for App {
             .create_window(
                 WindowAttributes::default()
                     .with_title("Game of Life")
-                    .with_min_surface_size(winit::dpi::LogicalSize::new(
+                    .with_surface_size(winit::dpi::LogicalSize::new(
                         f64::from(self.window_width),
                         f64::from(self.window_height),
                     )),
             )
             .unwrap();
-        self.vk = Some(Vk::new(self.window_width, self.window_height, window).unwrap());
+        let mut vk = Vk::new(window).unwrap();
+        vk.ensure_swapchain(false);
+        self.vk = Some(vk);
         self.app = Some(self.create_app.take().unwrap()(self.vk.as_ref().unwrap()));
     }
 
@@ -87,6 +89,11 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => event_loop.exit(),
+            WindowEvent::SurfaceResized(_) => {
+                if let Some(vk) = &mut self.vk {
+                    vk.ensure_swapchain(true);
+                }
+            }
             e => {
                 if let Some(app) = &mut self.app {
                     app.on_event(e, self.vk.as_ref().unwrap());
@@ -96,8 +103,8 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _: &dyn winit::event_loop::ActiveEventLoop) {
-        if let Some(vk) = &self.vk {
-            vk.render(|i| self.app.as_mut().unwrap().on_render(i, vk));
+        if let Some(vk) = &mut self.vk {
+            vk.render(|i, vk| self.app.as_mut().unwrap().on_render(i, vk));
         }
     }
 }
@@ -200,6 +207,26 @@ pub fn find_memorytype_index(
         .map(|(index, _memory_type)| index as _)
 }
 
+// Everything dependent on window/swapchain size
+pub struct Swapchain {
+    pub surface_resolution: vk::Extent2D,
+    pub swapchain: vk::SwapchainKHR,
+    pub present_images: Vec<vk::Image>,
+    pub present_image_views: Vec<vk::ImageView>,
+
+    pub screen_image: vk::Image,
+    pub screen_image_view: vk::ImageView,
+    pub screen_image_descriptor: [u8; 32],
+
+    // Images containing game of life
+    pub content_images: Vec<vk::Image>,
+    pub content_image_views: Vec<vk::ImageView>,
+    pub content_image_descriptors: Vec<[u8; 32]>,
+
+    pub width: u32,
+    pub height: u32,
+}
+
 #[allow(dead_code)]
 pub struct Vk {
     pub entry: Entry,
@@ -215,23 +242,13 @@ pub struct Vk {
     pub device_memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub queue_family_index: u32,
     pub present_queue: vk::Queue,
+    pub present_mode: vk::PresentModeKHR,
 
     pub surface: vk::SurfaceKHR,
     pub surface_format: vk::SurfaceFormatKHR,
-    pub surface_resolution: vk::Extent2D,
 
-    pub swapchain: vk::SwapchainKHR,
-    pub present_images: Vec<vk::Image>,
-    pub present_image_views: Vec<vk::ImageView>,
+    pub swapchain: Option<Swapchain>,
 
-    pub screen_image: vk::Image,
-    pub screen_image_view: vk::ImageView,
-    pub screen_image_descriptor: [u8; 32],
-
-    // Images containing game of life
-    pub content_images: Vec<vk::Image>,
-    pub content_image_views: Vec<vk::ImageView>,
-    pub content_image_descriptors: Vec<[u8; 32]>,
     pub content_image_sampler: [u8; 16],
 
     pub pool: vk::CommandPool,
@@ -243,17 +260,10 @@ pub struct Vk {
 
     pub draw_commands_reuse_fence: vk::Fence,
     pub setup_commands_reuse_fence: vk::Fence,
-
-    pub screen_width: u32,
-    pub screen_height: u32,
 }
 
 impl Vk {
-    pub fn new(
-        window_width: u32,
-        window_height: u32,
-        window: Box<dyn Window>,
-    ) -> Result<Self, Box<dyn Error>> {
+    pub fn new(window: Box<dyn Window>) -> Result<Self, Box<dyn Error>> {
         unsafe {
             let entry = Entry::load().expect("Failed to load Vulkan");
             let app_name = ffi::CStr::from_bytes_with_nul_unchecked(b"GameOfLife\0");
@@ -383,30 +393,6 @@ impl Vk {
                 .get_physical_device_surface_formats(pdevice, surface)
                 .unwrap()[0];
 
-            let surface_capabilities = surface_loader
-                .get_physical_device_surface_capabilities(pdevice, surface)
-                .unwrap();
-            let mut desired_image_count = surface_capabilities.min_image_count + 1;
-            if surface_capabilities.max_image_count > 0
-                && desired_image_count > surface_capabilities.max_image_count
-            {
-                desired_image_count = surface_capabilities.max_image_count;
-            }
-            let surface_resolution = match surface_capabilities.current_extent.width {
-                u32::MAX => vk::Extent2D {
-                    width: window_width,
-                    height: window_height,
-                },
-                _ => surface_capabilities.current_extent,
-            };
-            let pre_transform = if surface_capabilities
-                .supported_transforms
-                .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
-            {
-                vk::SurfaceTransformFlagsKHR::IDENTITY
-            } else {
-                surface_capabilities.current_transform
-            };
             let present_modes = surface_loader
                 .get_physical_device_surface_present_modes(pdevice, surface)
                 .unwrap();
@@ -416,26 +402,6 @@ impl Vk {
                 .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
                 .unwrap_or(vk::PresentModeKHR::FIFO);
             let swapchain_loader = swapchain::Device::new(&instance, &device);
-
-            let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
-                .surface(surface)
-                .min_image_count(desired_image_count)
-                .image_color_space(surface_format.color_space)
-                .image_format(surface_format.format)
-                .image_extent(surface_resolution)
-                .image_usage(
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
-                )
-                .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .pre_transform(pre_transform)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                .present_mode(present_mode)
-                .clipped(true)
-                .image_array_layers(1);
-
-            let swapchain = swapchain_loader
-                .create_swapchain(&swapchain_create_info, None)
-                .unwrap();
 
             let pool_create_info = vk::CommandPoolCreateInfo::default()
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
@@ -454,116 +420,8 @@ impl Vk {
             let setup_command_buffer = command_buffers[0];
             let draw_command_buffer = command_buffers[1];
 
-            let present_images = swapchain_loader.get_swapchain_images(swapchain).unwrap();
-            let present_image_views: Vec<vk::ImageView> = present_images
-                .iter()
-                .map(|&image| {
-                    let create_view_info = vk::ImageViewCreateInfo::default()
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(surface_format.format)
-                        .components(vk::ComponentMapping {
-                            r: vk::ComponentSwizzle::R,
-                            g: vk::ComponentSwizzle::G,
-                            b: vk::ComponentSwizzle::B,
-                            a: vk::ComponentSwizzle::A,
-                        })
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        })
-                        .image(image);
-                    device.create_image_view(&create_view_info, None).unwrap()
-                })
-                .collect();
-
             let device_memory_properties = instance.get_physical_device_memory_properties(pdevice);
             let get_descriptor_device = descriptor_buffer::Device::new(&instance, &device);
-
-            let create_img_internal = |width, height, format, usage| {
-                let info = vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .extent(vk::Extent3D::default().width(width).height(height).depth(1))
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .format(format)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .initial_layout(vk::ImageLayout::GENERAL)
-                    .usage(usage)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .samples(vk::SampleCountFlags::TYPE_1);
-                let image = device.create_image(&info, None).unwrap();
-
-                let reqs = device.get_image_memory_requirements(image);
-                let alloc_info = vk::MemoryAllocateInfo::default()
-                    .allocation_size(reqs.size)
-                    .memory_type_index(
-                        find_memorytype_index(
-                            &reqs,
-                            &device_memory_properties,
-                            vk::MemoryPropertyFlags::empty(),
-                        )
-                        .expect("Failed to find memory type"),
-                    );
-                let memory = device.allocate_memory(&alloc_info, None).unwrap();
-                device.bind_image_memory(image, memory, 0).unwrap();
-
-                let create_view_info = vk::ImageViewCreateInfo::default()
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
-                    .components(vk::ComponentMapping {
-                        r: vk::ComponentSwizzle::R,
-                        g: vk::ComponentSwizzle::G,
-                        b: vk::ComponentSwizzle::B,
-                        a: vk::ComponentSwizzle::A,
-                    })
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .image(image);
-                let view = device.create_image_view(&create_view_info, None).unwrap();
-
-                let ii = vk::DescriptorImageInfo::default()
-                    .image_view(view)
-                    .image_layout(vk::ImageLayout::GENERAL);
-                let info = vk::DescriptorGetInfoEXT::default()
-                    .ty(vk::DescriptorType::STORAGE_IMAGE)
-                    .data(vk::DescriptorDataEXT {
-                        p_storage_image: &ii as *const _,
-                    });
-                let mut desc = [0u8; 32];
-                get_descriptor_device.get_descriptor(&info, &mut desc);
-
-                (image, view, desc)
-            };
-
-            let create_img = |width, height| {
-                create_img_internal(
-                    width,
-                    height,
-                    vk::Format::R8_UINT,
-                    vk::ImageUsageFlags::STORAGE,
-                )
-            };
-
-            let a = create_img(100, 100);
-            let b = create_img(100, 100);
-            let (screen_image, screen_image_view, screen_image_descriptor) = create_img_internal(
-                window_width,
-                window_height,
-                surface_format.format,
-                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-            );
-
-            let content_images = vec![a.0, b.0];
-            let content_image_views = vec![a.1, b.1];
-            let content_image_descriptors = vec![a.2, b.2];
 
             let content_image_sampler = {
                 let sampler_info = vk::SamplerCreateInfo::default()
@@ -618,17 +476,9 @@ impl Vk {
                 surface_loader,
                 surface_format,
                 present_queue,
-                surface_resolution,
+                present_mode,
                 swapchain_loader,
-                swapchain,
-                present_images,
-                present_image_views,
-                screen_image,
-                screen_image_view,
-                screen_image_descriptor,
-                content_images,
-                content_image_views,
-                content_image_descriptors,
+                swapchain: None,
                 content_image_sampler,
                 pool,
                 draw_command_buffer,
@@ -640,26 +490,285 @@ impl Vk {
                 surface,
                 debug_call_back,
                 debug_utils_loader,
-                screen_width: window_width,
-                screen_height: window_height,
             })
         }
     }
 
-    pub fn render<'a, F: FnMut(u32) + 'a>(&'a self, mut f: F) {
-        unsafe {
-            let (present_index, _suboptimal) = self
-                .swapchain_loader
-                .acquire_next_image(
-                    self.swapchain,
-                    std::u64::MAX,
-                    self.present_complete_semaphore,
-                    vk::Fence::null(),
-                )
-                .unwrap();
-            f(present_index);
+    fn ensure_swapchain(&mut self, force_recreate: bool) {
+        if self.swapchain.is_some() && !force_recreate {
+            return;
+        }
 
-            let present_image = self.present_images[present_index as usize];
+        unsafe {
+            let surface_capabilities = self
+                .surface_loader
+                .get_physical_device_surface_capabilities(self.pdevice, self.surface)
+                .unwrap();
+
+            let mut desired_image_count = surface_capabilities.min_image_count + 1;
+            if surface_capabilities.max_image_count > 0
+                && desired_image_count > surface_capabilities.max_image_count
+            {
+                desired_image_count = surface_capabilities.max_image_count;
+            }
+            let surface_resolution = match surface_capabilities.current_extent.width {
+                u32::MAX => {
+                    let size = self.window.surface_size();
+                    vk::Extent2D {
+                        width: size.width,
+                        height: size.height,
+                    }
+                }
+                _ => surface_capabilities.current_extent,
+            };
+            println!("Creating swapchain with size {surface_resolution:?}");
+
+            let get_descriptor_device =
+                descriptor_buffer::Device::new(&self.instance, &self.device);
+            let create_img_internal = |width, height, format, usage| {
+                let info = vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .extent(vk::Extent3D::default().width(width).height(height).depth(1))
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .format(format)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .initial_layout(vk::ImageLayout::GENERAL)
+                    .usage(usage)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .samples(vk::SampleCountFlags::TYPE_1);
+                let image = self.device.create_image(&info, None).unwrap();
+
+                let reqs = self.device.get_image_memory_requirements(image);
+                let alloc_info = vk::MemoryAllocateInfo::default()
+                    .allocation_size(reqs.size)
+                    .memory_type_index(
+                        find_memorytype_index(
+                            &reqs,
+                            &self.device_memory_properties,
+                            vk::MemoryPropertyFlags::empty(),
+                        )
+                        .expect("Failed to find memory type"),
+                    );
+                let memory = self.device.allocate_memory(&alloc_info, None).unwrap();
+                self.device.bind_image_memory(image, memory, 0).unwrap();
+
+                let create_view_info = vk::ImageViewCreateInfo::default()
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .components(vk::ComponentMapping {
+                        r: vk::ComponentSwizzle::R,
+                        g: vk::ComponentSwizzle::G,
+                        b: vk::ComponentSwizzle::B,
+                        a: vk::ComponentSwizzle::A,
+                    })
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image(image);
+                let view = self
+                    .device
+                    .create_image_view(&create_view_info, None)
+                    .unwrap();
+
+                let ii = vk::DescriptorImageInfo::default()
+                    .image_view(view)
+                    .image_layout(vk::ImageLayout::GENERAL);
+                let info = vk::DescriptorGetInfoEXT::default()
+                    .ty(vk::DescriptorType::STORAGE_IMAGE)
+                    .data(vk::DescriptorDataEXT {
+                        p_storage_image: &ii as *const _,
+                    });
+                let mut desc = [0u8; 32];
+                get_descriptor_device.get_descriptor(&info, &mut desc);
+
+                (image, view, desc)
+            };
+
+            let create_img = |width, height| {
+                create_img_internal(
+                    width,
+                    height,
+                    vk::Format::R8_UINT,
+                    vk::ImageUsageFlags::STORAGE
+                        | vk::ImageUsageFlags::TRANSFER_SRC
+                        | vk::ImageUsageFlags::TRANSFER_DST,
+                )
+            };
+
+            const TILE_SIZE: u32 = 16;
+
+            let width = surface_resolution.width / TILE_SIZE;
+            let height = surface_resolution.height / TILE_SIZE;
+            let a = create_img(width, height);
+            let b = create_img(width, height);
+            let (screen_image, screen_image_view, screen_image_descriptor) = create_img_internal(
+                surface_resolution.width,
+                surface_resolution.height,
+                self.surface_format.format,
+                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            );
+
+            let content_images = vec![a.0, b.0];
+            let content_image_views = vec![a.1, b.1];
+            let content_image_descriptors = vec![a.2, b.2];
+
+            if let Some(swapchain) = self.swapchain.take() {
+                // Copy old to new content images
+                record_submit_commandbuffer(
+                    &self.device,
+                    self.draw_command_buffer,
+                    self.draw_commands_reuse_fence,
+                    self.present_queue,
+                    &[],
+                    &[],
+                    &[],
+                    |device, draw_command_buffer| {
+                        let sub_layers = vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1);
+                        let regions = [vk::ImageCopy2::default()
+                            .src_subresource(sub_layers)
+                            .dst_subresource(sub_layers)
+                            .extent(
+                                vk::Extent3D::default()
+                                    .width(width.min(swapchain.width))
+                                    .height(height.min(swapchain.height))
+                                    .depth(1),
+                            )];
+
+                        for i in 0..swapchain.content_images.len() {
+                            let copy_info = vk::CopyImageInfo2::default()
+                                .src_image(swapchain.content_images[i])
+                                .src_image_layout(vk::ImageLayout::GENERAL)
+                                .dst_image(content_images[i])
+                                .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                                .regions(&regions);
+                            device.cmd_copy_image2(draw_command_buffer, &copy_info);
+                        }
+                    },
+                );
+
+                self.device.device_wait_idle().unwrap();
+
+                swapchain.clear(self);
+            }
+
+            let pre_transform = if surface_capabilities
+                .supported_transforms
+                .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
+            {
+                vk::SurfaceTransformFlagsKHR::IDENTITY
+            } else {
+                surface_capabilities.current_transform
+            };
+
+            let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
+                .surface(self.surface)
+                .min_image_count(desired_image_count)
+                .image_color_space(self.surface_format.color_space)
+                .image_format(self.surface_format.format)
+                .image_extent(surface_resolution)
+                .image_usage(
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
+                )
+                .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .pre_transform(pre_transform)
+                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                .present_mode(self.present_mode)
+                .clipped(true)
+                .image_array_layers(1);
+
+            let swapchain = self
+                .swapchain_loader
+                .create_swapchain(&swapchain_create_info, None)
+                .unwrap();
+
+            let present_images = self
+                .swapchain_loader
+                .get_swapchain_images(swapchain)
+                .unwrap();
+            let present_image_views: Vec<vk::ImageView> = present_images
+                .iter()
+                .map(|&image| {
+                    let create_view_info = vk::ImageViewCreateInfo::default()
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(self.surface_format.format)
+                        .components(vk::ComponentMapping {
+                            r: vk::ComponentSwizzle::R,
+                            g: vk::ComponentSwizzle::G,
+                            b: vk::ComponentSwizzle::B,
+                            a: vk::ComponentSwizzle::A,
+                        })
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .image(image);
+                    self.device
+                        .create_image_view(&create_view_info, None)
+                        .unwrap()
+                })
+                .collect();
+
+            self.swapchain = Some(Swapchain {
+                surface_resolution,
+                swapchain,
+                present_images,
+                present_image_views,
+                screen_image,
+                screen_image_view,
+                screen_image_descriptor,
+                content_images,
+                content_image_views,
+                content_image_descriptors,
+
+                width,
+                height,
+            })
+        }
+    }
+
+    pub fn render<'a, F: FnMut(u32, &Self) + 'a>(&'a mut self, mut f: F) {
+        unsafe {
+            self.ensure_swapchain(false);
+            let (mut present_index, suboptimal) = {
+                let swapchain = self.swapchain.as_ref().unwrap();
+                self.swapchain_loader
+                    .acquire_next_image(
+                        swapchain.swapchain,
+                        std::u64::MAX,
+                        self.present_complete_semaphore,
+                        vk::Fence::null(),
+                    )
+                    .unwrap()
+            };
+            if suboptimal {
+                println!("Is suboptimal");
+                self.ensure_swapchain(true);
+                let swapchain = self.swapchain.as_ref().unwrap();
+                present_index = self
+                    .swapchain_loader
+                    .acquire_next_image(
+                        swapchain.swapchain,
+                        std::u64::MAX,
+                        self.present_complete_semaphore,
+                        vk::Fence::null(),
+                    )
+                    .unwrap()
+                    .0;
+            }
+            f(present_index, self);
+            let swapchain = self.swapchain.as_ref().unwrap();
+
+            let present_image = swapchain.present_images[present_index as usize];
             record_submit_commandbuffer(
                 &self.device,
                 self.draw_command_buffer,
@@ -677,12 +786,12 @@ impl Vk {
                         .dst_subresource(sub_layers)
                         .extent(
                             vk::Extent3D::default()
-                                .width(self.screen_width)
-                                .height(self.screen_height)
+                                .width(swapchain.surface_resolution.width)
+                                .height(swapchain.surface_resolution.height)
                                 .depth(1),
                         )];
                     let copy_info = vk::CopyImageInfo2::default()
-                        .src_image(self.screen_image)
+                        .src_image(swapchain.screen_image)
                         .src_image_layout(vk::ImageLayout::GENERAL)
                         .dst_image(present_image)
                         .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -765,7 +874,7 @@ impl Vk {
             );
 
             let wait_semaphors = [self.rendering_complete_semaphore];
-            let swapchains = [self.swapchain];
+            let swapchains = [swapchain.swapchain];
             let image_indices = [present_index];
             let present_info = vk::PresentInfoKHR::default()
                 .wait_semaphores(&wait_semaphors) // &self.rendering_complete_semaphore)
@@ -794,6 +903,25 @@ impl Vk {
     }
 }
 
+impl Swapchain {
+    fn clear(&self, vk: &Vk) {
+        unsafe {
+            for &image_view in self.present_image_views.iter() {
+                vk.device.destroy_image_view(image_view, None);
+            }
+            vk.device.destroy_image_view(self.screen_image_view, None);
+            vk.device.destroy_image(self.screen_image, None);
+            for &image_view in self.content_image_views.iter() {
+                vk.device.destroy_image_view(image_view, None);
+            }
+            for &image in self.content_images.iter() {
+                vk.device.destroy_image(image, None);
+            }
+            vk.swapchain_loader.destroy_swapchain(self.swapchain, None);
+        }
+    }
+}
+
 impl Drop for Vk {
     fn drop(&mut self) {
         unsafe {
@@ -806,22 +934,12 @@ impl Drop for Vk {
                 .destroy_fence(self.draw_commands_reuse_fence, None);
             self.device
                 .destroy_fence(self.setup_commands_reuse_fence, None);
-            for &image_view in self.present_image_views.iter() {
-                self.device.destroy_image_view(image_view, None);
-            }
-            self.device.destroy_image_view(self.screen_image_view, None);
-            self.device.destroy_image(self.screen_image, None);
-            for &image_view in self.content_image_views.iter() {
-                self.device.destroy_image_view(image_view, None);
-            }
-            for &image in self.content_images.iter() {
-                self.device.destroy_image(image, None);
+            if let Some(swapchain) = self.swapchain.take() {
+                swapchain.clear(self);
             }
             // self.device
             // .destroy_sampler(self.content_image_sampler, None);
             self.device.destroy_command_pool(self.pool, None);
-            self.swapchain_loader
-                .destroy_swapchain(self.swapchain, None);
             self.device.destroy_device(None);
             self.surface_loader.destroy_surface(self.surface, None);
             self.debug_utils_loader

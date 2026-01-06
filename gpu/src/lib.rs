@@ -239,7 +239,7 @@ pub unsafe extern "gpu-kernel" fn set(img: ImageDesc, x: u32, y: u32, val: f32) 
     unsafe { image_store(val, 1, x, y, img, 0, 0) };
 }
 
-#[allow(clippy::missing_safety_doc)]
+#[allow(unused_variables, clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn check(
     img: ImageDesc,
