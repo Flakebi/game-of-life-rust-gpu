@@ -1,4 +1,9 @@
-#![allow(internal_features, improper_ctypes)]
+#![allow(
+    internal_features,
+    improper_ctypes,
+    improper_ctypes_definitions,
+    improper_gpu_kernel_arg
+)]
 #![feature(
     abi_gpu_kernel,
     core_intrinsics,
@@ -114,6 +119,7 @@ pub unsafe extern "gpu-kernel" fn kernel(
     height: u32,
     screen_width: u32,
     screen_height: u32,
+    paused: u32,
 ) {
     // let args: &KernelArgs = unsafe { &*(__amdgpu_util_kernarg_segment_ptr() as *const _) };
     let dispatch = dispatch_ptr();
@@ -161,7 +167,9 @@ pub unsafe extern "gpu-kernel" fn kernel(
             }
         }
 
-        let new_val = if sum == 3 {
+        let new_val = if paused == 1 {
+            if val > 128 { 1.0 } else { 0.0 }
+        } else if sum == 3 {
             // Becomes alive
             1.0
         } else if sum != 2 {

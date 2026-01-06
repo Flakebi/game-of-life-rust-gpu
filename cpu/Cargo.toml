@@ -9,4 +9,4 @@ ash = "0.38"
 ash-window = "0.13"
 clap = { version = "4", features = ["derive"] }
 hip-runtime-sys = "0.1"
-winit = { version = "0.29", features = ["rwh_06"] }
+winit = "0.31.0-beta.2"

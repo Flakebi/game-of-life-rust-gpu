@@ -1,7 +1,7 @@
 use std::default::Default;
 use std::error::Error;
 use std::ffi;
-use std::{borrow::Cow, cell::RefCell, ops::Drop, os::raw::c_char};
+use std::{borrow::Cow, ops::Drop, os::raw::c_char};
 
 use ash::vk;
 use ash::{
@@ -9,14 +9,98 @@ use ash::{
     ext::{debug_utils, descriptor_buffer},
     khr::{surface, swapchain},
 };
+use winit::application::ApplicationHandler;
+use winit::window::{Window, WindowAttributes};
 use winit::{
-    event::{ElementState, Event, KeyEvent, WindowEvent},
+    event::{ElementState, KeyEvent, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     keyboard::{Key, NamedKey},
-    platform::run_on_demand::EventLoopExtRunOnDemand,
     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
-    window::WindowBuilder,
 };
+
+pub trait MyApp {
+    fn on_render(&mut self, index: u32, win: &Vk);
+    fn on_event(&mut self, event: WindowEvent, win: &Vk);
+}
+
+pub struct App {
+    window_width: u32,
+    window_height: u32,
+    vk: Option<Vk>,
+    create_app: Option<Box<dyn FnOnce(&Vk) -> Box<dyn MyApp>>>,
+    app: Option<Box<dyn MyApp>>,
+}
+
+impl App {
+    pub fn new(
+        window_width: u32,
+        window_height: u32,
+        create_app: Box<dyn FnOnce(&Vk) -> Box<dyn MyApp>>,
+    ) -> Self {
+        Self {
+            window_width,
+            window_height,
+            vk: None,
+            create_app: Some(create_app),
+            app: None,
+        }
+    }
+
+    pub fn run(self) -> Result<(), Box<dyn Error>> {
+        let event_loop = EventLoop::new()?;
+        event_loop.set_control_flow(ControlFlow::Wait);
+        Ok(event_loop.run_app(self)?)
+    }
+}
+
+impl ApplicationHandler for App {
+    fn can_create_surfaces(&mut self, event_loop: &dyn winit::event_loop::ActiveEventLoop) {
+        event_loop.set_control_flow(ControlFlow::Poll);
+        let window = event_loop
+            .create_window(
+                WindowAttributes::default()
+                    .with_title("Game of Life")
+                    .with_min_surface_size(winit::dpi::LogicalSize::new(
+                        f64::from(self.window_width),
+                        f64::from(self.window_height),
+                    )),
+            )
+            .unwrap();
+        self.vk = Some(Vk::new(self.window_width, self.window_height, window).unwrap());
+        self.app = Some(self.create_app.take().unwrap()(self.vk.as_ref().unwrap()));
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &dyn winit::event_loop::ActiveEventLoop,
+        _: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested
+            | WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        logical_key: Key::Named(NamedKey::Escape),
+                        ..
+                    },
+                ..
+            } => event_loop.exit(),
+            e => {
+                if let Some(app) = &mut self.app {
+                    app.on_event(e, self.vk.as_ref().unwrap());
+                }
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, _: &dyn winit::event_loop::ActiveEventLoop) {
+        if let Some(vk) = &self.vk {
+            vk.render(|i| self.app.as_mut().unwrap().on_render(i, vk));
+        }
+    }
+}
 
 /// Helper function for submitting command buffers. Immediately waits for the fence before the command buffer
 /// is executed. That way we can delay the waiting for the fences by 1 frame which is good for performance.
@@ -124,8 +208,7 @@ pub struct Vk {
     pub surface_loader: surface::Instance,
     pub swapchain_loader: swapchain::Device,
     pub debug_utils_loader: debug_utils::Instance,
-    pub window: winit::window::Window,
-    pub event_loop: RefCell<EventLoop<()>>,
+    pub window: Box<dyn Window>,
     pub debug_call_back: vk::DebugUtilsMessengerEXT,
 
     pub pdevice: vk::PhysicalDevice,
@@ -166,43 +249,12 @@ pub struct Vk {
 }
 
 impl Vk {
-    pub fn render_loop<'a, F: FnMut() + 'a>(&'a self, mut f: F) -> Result<(), impl Error> {
-        self.event_loop.borrow_mut().run_on_demand(|event, elwp| {
-            elwp.set_control_flow(ControlFlow::Poll);
-            match event {
-                Event::WindowEvent {
-                    event:
-                        WindowEvent::CloseRequested
-                        | WindowEvent::KeyboardInput {
-                            event:
-                                KeyEvent {
-                                    state: ElementState::Pressed,
-                                    logical_key: Key::Named(NamedKey::Escape),
-                                    ..
-                                },
-                            ..
-                        },
-                    ..
-                } => {
-                    elwp.exit();
-                }
-                Event::AboutToWait => f(),
-                _ => (),
-            }
-        })
-    }
-
-    pub fn new(window_width: u32, window_height: u32) -> Result<Self, Box<dyn Error>> {
+    pub fn new(
+        window_width: u32,
+        window_height: u32,
+        window: Box<dyn Window>,
+    ) -> Result<Self, Box<dyn Error>> {
         unsafe {
-            let event_loop = EventLoop::new()?;
-            let window = WindowBuilder::new()
-                .with_title("Game of Life")
-                .with_inner_size(winit::dpi::LogicalSize::new(
-                    f64::from(window_width),
-                    f64::from(window_height),
-                ))
-                .build(&event_loop)
-                .unwrap();
             let entry = Entry::load().expect("Failed to load Vulkan");
             let app_name = ffi::CStr::from_bytes_with_nul_unchecked(b"GameOfLife\0");
 
@@ -556,7 +608,6 @@ impl Vk {
                 .unwrap();
 
             Ok(Self {
-                event_loop: RefCell::new(event_loop),
                 entry,
                 instance,
                 device,
@@ -595,138 +646,136 @@ impl Vk {
         }
     }
 
-    pub fn render_loop2<'a, F: FnMut(u32) + 'a>(&'a self, mut f: F) -> Result<(), impl Error> {
+    pub fn render<'a, F: FnMut(u32) + 'a>(&'a self, mut f: F) {
         unsafe {
-            self.render_loop(move || {
-                let (present_index, _suboptimal) = self
-                    .swapchain_loader
-                    .acquire_next_image(
-                        self.swapchain,
-                        std::u64::MAX,
-                        self.present_complete_semaphore,
-                        vk::Fence::null(),
-                    )
-                    .unwrap();
-                f(present_index);
+            let (present_index, _suboptimal) = self
+                .swapchain_loader
+                .acquire_next_image(
+                    self.swapchain,
+                    std::u64::MAX,
+                    self.present_complete_semaphore,
+                    vk::Fence::null(),
+                )
+                .unwrap();
+            f(present_index);
 
-                let present_image = self.present_images[present_index as usize];
-                record_submit_commandbuffer(
-                    &self.device,
-                    self.draw_command_buffer,
-                    self.draw_commands_reuse_fence,
-                    self.present_queue,
-                    &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT],
-                    &[self.present_complete_semaphore],
-                    &[self.rendering_complete_semaphore],
-                    |device, draw_command_buffer| {
-                        let sub_layers = vk::ImageSubresourceLayers::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .layer_count(1);
-                        let regions = [vk::ImageCopy2::default()
-                            .src_subresource(sub_layers)
-                            .dst_subresource(sub_layers)
-                            .extent(
-                                vk::Extent3D::default()
-                                    .width(self.screen_width)
-                                    .height(self.screen_height)
-                                    .depth(1),
-                            )];
-                        let copy_info = vk::CopyImageInfo2::default()
-                            .src_image(self.screen_image)
-                            .src_image_layout(vk::ImageLayout::GENERAL)
-                            .dst_image(present_image)
-                            .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                            .regions(&regions);
+            let present_image = self.present_images[present_index as usize];
+            record_submit_commandbuffer(
+                &self.device,
+                self.draw_command_buffer,
+                self.draw_commands_reuse_fence,
+                self.present_queue,
+                &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT],
+                &[self.present_complete_semaphore],
+                &[self.rendering_complete_semaphore],
+                |device, draw_command_buffer| {
+                    let sub_layers = vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1);
+                    let regions = [vk::ImageCopy2::default()
+                        .src_subresource(sub_layers)
+                        .dst_subresource(sub_layers)
+                        .extent(
+                            vk::Extent3D::default()
+                                .width(self.screen_width)
+                                .height(self.screen_height)
+                                .depth(1),
+                        )];
+                    let copy_info = vk::CopyImageInfo2::default()
+                        .src_image(self.screen_image)
+                        .src_image_layout(vk::ImageLayout::GENERAL)
+                        .dst_image(present_image)
+                        .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .regions(&regions);
 
-                        let sub_range = vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1);
-                        device.cmd_pipeline_barrier(
-                            draw_command_buffer,
-                            vk::PipelineStageFlags::TOP_OF_PIPE,
-                            vk::PipelineStageFlags::TRANSFER,
-                            vk::DependencyFlags::default(),
-                            &[],
-                            &[],
-                            &[vk::ImageMemoryBarrier::default()
-                                .old_layout(vk::ImageLayout::UNDEFINED)
-                                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                                .image(present_image)
-                                .subresource_range(sub_range)
-                                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)],
-                        );
-                        device.cmd_copy_image2(draw_command_buffer, &copy_info);
-                        device.cmd_pipeline_barrier(
-                            draw_command_buffer,
-                            vk::PipelineStageFlags::TRANSFER,
-                            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                            vk::DependencyFlags::default(),
-                            &[],
-                            &[],
-                            &[vk::ImageMemoryBarrier::default()
-                                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                                .image(present_image)
-                                .subresource_range(sub_range)
-                                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                                .dst_access_mask(vk::AccessFlags::empty())],
-                        );
-                        /*device.cmd_begin_render_pass(
-                            draw_command_buffer,
-                            &render_pass_begin_info,
-                            vk::SubpassContents::INLINE,
-                        );
-                        device.cmd_bind_pipeline(
-                            draw_command_buffer,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            graphic_pipeline,
-                        );
-                        device.cmd_set_viewport(draw_command_buffer, 0, &viewports);
-                        device.cmd_set_scissor(draw_command_buffer, 0, &scissors);
-                        device.cmd_bind_vertex_buffers(
-                            draw_command_buffer,
-                            0,
-                            &[vertex_input_buffer],
-                            &[0],
-                        );
-                        device.cmd_bind_index_buffer(
-                            draw_command_buffer,
-                            index_buffer,
-                            0,
-                            vk::IndexType::UINT32,
-                        );
-                        device.cmd_draw_indexed(
-                            draw_command_buffer,
-                            index_buffer_data.len() as u32,
-                            1,
-                            0,
-                            0,
-                            1,
-                        );
-                        // Or draw without the index buffer
-                        // device.cmd_draw(draw_command_buffer, 3, 1, 0, 0);
-                        device.cmd_end_render_pass(draw_command_buffer);*/
-                    },
-                );
+                    let sub_range = vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1);
+                    device.cmd_pipeline_barrier(
+                        draw_command_buffer,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::default(),
+                        &[],
+                        &[],
+                        &[vk::ImageMemoryBarrier::default()
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(present_image)
+                            .subresource_range(sub_range)
+                            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)],
+                    );
+                    device.cmd_copy_image2(draw_command_buffer, &copy_info);
+                    device.cmd_pipeline_barrier(
+                        draw_command_buffer,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        vk::DependencyFlags::default(),
+                        &[],
+                        &[],
+                        &[vk::ImageMemoryBarrier::default()
+                            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(present_image)
+                            .subresource_range(sub_range)
+                            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                            .dst_access_mask(vk::AccessFlags::empty())],
+                    );
+                    /*device.cmd_begin_render_pass(
+                        draw_command_buffer,
+                        &render_pass_begin_info,
+                        vk::SubpassContents::INLINE,
+                    );
+                    device.cmd_bind_pipeline(
+                        draw_command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        graphic_pipeline,
+                    );
+                    device.cmd_set_viewport(draw_command_buffer, 0, &viewports);
+                    device.cmd_set_scissor(draw_command_buffer, 0, &scissors);
+                    device.cmd_bind_vertex_buffers(
+                        draw_command_buffer,
+                        0,
+                        &[vertex_input_buffer],
+                        &[0],
+                    );
+                    device.cmd_bind_index_buffer(
+                        draw_command_buffer,
+                        index_buffer,
+                        0,
+                        vk::IndexType::UINT32,
+                    );
+                    device.cmd_draw_indexed(
+                        draw_command_buffer,
+                        index_buffer_data.len() as u32,
+                        1,
+                        0,
+                        0,
+                        1,
+                    );
+                    // Or draw without the index buffer
+                    // device.cmd_draw(draw_command_buffer, 3, 1, 0, 0);
+                    device.cmd_end_render_pass(draw_command_buffer);*/
+                },
+            );
 
-                let wait_semaphors = [self.rendering_complete_semaphore];
-                let swapchains = [self.swapchain];
-                let image_indices = [present_index];
-                let present_info = vk::PresentInfoKHR::default()
-                    .wait_semaphores(&wait_semaphors) // &self.rendering_complete_semaphore)
-                    .swapchains(&swapchains)
-                    .image_indices(&image_indices);
+            let wait_semaphors = [self.rendering_complete_semaphore];
+            let swapchains = [self.swapchain];
+            let image_indices = [present_index];
+            let present_info = vk::PresentInfoKHR::default()
+                .wait_semaphores(&wait_semaphors) // &self.rendering_complete_semaphore)
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
 
-                self.swapchain_loader
-                    .queue_present(self.present_queue, &present_info)
-                    .unwrap();
-                self.device.device_wait_idle().unwrap();
-            })
+            self.swapchain_loader
+                .queue_present(self.present_queue, &present_info)
+                .unwrap();
+            self.device.device_wait_idle().unwrap();
         }
     }
 
