@@ -148,13 +148,26 @@ fn main() {
         let result = hipModuleGetFunction(&mut function, module, kernel_name.as_ptr());
         assert_eq!(result, hipError_t::hipSuccess);
 
-        // Assemble arguments for the kernel.
-        // Pass two pointers, input_device and output_device
+        #[allow(dead_code)]
+        struct ClearKernelArgs {
+            image_desc: [u8; 32],
+            width: u32,
+            height: u32,
+        }
+
+        #[allow(dead_code)]
+        struct SetKernelArgs {
+            image_desc: [u8; 32],
+            x: u32,
+            y: u32,
+            val: f32,
+        }
+
         #[allow(dead_code)]
         struct KernelArgs {
             old_content_desc: [u8; 32],
             new_content_desc: [u8; 32],
-            present_desc: [u8; 32],
+            screen_desc: [u8; 32],
             sampler: [u8; 16],
             width: u32,
             height: u32,
@@ -162,18 +175,69 @@ fn main() {
             screen_height: u32,
         }
 
-        win.render_loop2(|i| {
-            let present_desc = win.present_image_descriptors[i as usize];
-            let old_content_desc = win.content_image_descriptors[((i + 1) % 2) as usize];
-            let new_content_desc = win.content_image_descriptors[(i % 2) as usize];
+        // Clear image
+        println!("Get function clear");
+        let mut clear: hipFunction_t = std::ptr::null_mut();
+        let result = hipModuleGetFunction(&mut clear, module, b"clear\0".as_ptr() as *const _);
+        assert_eq!(result, hipError_t::hipSuccess);
+
+        for image in &win.content_image_descriptors {
+            let kernel_args = &mut ClearKernelArgs {
+                image_desc: *image,
+                width,
+                height,
+            };
+            let mut size = std::mem::size_of_val(kernel_args);
+
+            #[allow(clippy::manual_dangling_ptr)]
+            let mut config = [
+                0x1 as *mut c_void,                          // Next come arguments
+                kernel_args as *mut _ as *mut c_void,        // Pointer to arguments
+                0x2 as *mut c_void,                          // Next comes size
+                std::ptr::addr_of_mut!(size) as *mut c_void, // Pointer to size of arguments
+                0x3 as *mut c_void,                          // End
+            ];
+
+            const WG_SIZE: u32 = 16;
+            // Launch two workgroups (2x1x1), each of the size 16x16x1
+            let wg_x = width.div_ceil(WG_SIZE);
+            let wg_y = height.div_ceil(WG_SIZE);
+            let result = hipModuleLaunchKernel(
+                clear,
+                wg_x,                 // Workgroup count x
+                wg_y,                 // Workgroup count y
+                1,                    // Workgroup count z
+                WG_SIZE,              // Workgroup dim x
+                WG_SIZE,              // Workgroup dim y
+                1,                    // Workgroup dim z
+                0,                    // sharedMemBytes for extern shared variables
+                std::ptr::null_mut(), // stream
+                std::ptr::null_mut(), // params (unimplemented in hip)
+                config.as_mut_ptr(),  // arguments
+            );
+            assert_eq!(result, hipError_t::hipSuccess);
+
+            let result = hipDeviceSynchronize();
+            assert_eq!(result, hipError_t::hipSuccess);
+        }
+        println!("Images cleared");
+
+        let mut i = 0;
+        win.render_loop2(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            i ^= 1;
+            // TODO Write directly to screen image
+            let screen_desc = win.screen_image_descriptor;
+            let old_content_desc = win.content_image_descriptors[(i ^ 1) as usize];
+            let new_content_desc = win.content_image_descriptors[i as usize];
             let sampler = win.content_image_sampler;
 
             let width = 100;
             let height = 100;
-            let kernel_args: &mut KernelArgs = &mut KernelArgs {
+            let kernel_args = &mut KernelArgs {
                 old_content_desc,
                 new_content_desc,
-                present_desc,
+                screen_desc,
                 sampler,
                 width,
                 height,
@@ -195,7 +259,7 @@ fn main() {
             // Launch two workgroups (2x1x1), each of the size 16x16x1
             let wg_x = width.div_ceil(WG_SIZE);
             let wg_y = height.div_ceil(WG_SIZE);
-            println!("Launch {} {wg_x}x{wg_y}x1", args.kernel);
+            // println!("Launch {} {wg_x}x{wg_y}x1", args.kernel);
             let result = hipModuleLaunchKernel(
                 function,
                 wg_x,                 // Workgroup count x
@@ -211,7 +275,7 @@ fn main() {
             );
             assert_eq!(result, hipError_t::hipSuccess);
 
-            println!("Wait for finish");
+            // println!("Wait for finish");
             let result = hipDeviceSynchronize();
             assert_eq!(result, hipError_t::hipSuccess);
         })

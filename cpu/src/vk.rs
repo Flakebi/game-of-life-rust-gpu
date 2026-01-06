@@ -116,6 +116,7 @@ pub fn find_memorytype_index(
         .map(|(index, _memory_type)| index as _)
 }
 
+#[allow(dead_code)]
 pub struct Vk {
     pub entry: Entry,
     pub instance: Instance,
@@ -139,7 +140,10 @@ pub struct Vk {
     pub swapchain: vk::SwapchainKHR,
     pub present_images: Vec<vk::Image>,
     pub present_image_views: Vec<vk::ImageView>,
-    pub present_image_descriptors: Vec<[u8; 32]>,
+
+    pub screen_image: vk::Image,
+    pub screen_image_view: vk::ImageView,
+    pub screen_image_descriptor: [u8; 32],
 
     // Images containing game of life
     pub content_images: Vec<vk::Image>,
@@ -156,10 +160,13 @@ pub struct Vk {
 
     pub draw_commands_reuse_fence: vk::Fence,
     pub setup_commands_reuse_fence: vk::Fence,
+
+    pub screen_width: u32,
+    pub screen_height: u32,
 }
 
 impl Vk {
-    pub fn render_loop<'a, F: Fn() + 'a>(&'a self, f: F) -> Result<(), impl Error> {
+    pub fn render_loop<'a, F: FnMut() + 'a>(&'a self, mut f: F) -> Result<(), impl Error> {
         self.event_loop.borrow_mut().run_on_demand(|event, elwp| {
             elwp.set_control_flow(ControlFlow::Poll);
             match event {
@@ -305,10 +312,14 @@ impl Vk {
                 .queue_family_index(queue_family_index)
                 .queue_priorities(&priorities);
 
+            let mut device_descriptor_features =
+                vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
+
             let device_create_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(std::slice::from_ref(&queue_info))
                 .enabled_extension_names(&device_extension_names_raw)
-                .enabled_features(&features);
+                .enabled_features(&features)
+                .push_next(&mut device_descriptor_features);
 
             let device: Device = instance
                 .create_device(pdevice, &device_create_info, None)
@@ -360,7 +371,9 @@ impl Vk {
                 .image_color_space(surface_format.color_space)
                 .image_format(surface_format.format)
                 .image_extent(surface_resolution)
-                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                .image_usage(
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
+                )
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .pre_transform(pre_transform)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -417,43 +430,21 @@ impl Vk {
             let device_memory_properties = instance.get_physical_device_memory_properties(pdevice);
             let get_descriptor_device = descriptor_buffer::Device::new(&instance, &device);
 
-            let present_image_descriptors = present_image_views
-                .iter()
-                .map(|&image| {
-                    let ii = vk::DescriptorImageInfo::default()
-                        .image_view(image)
-                        .image_layout(vk::ImageLayout::GENERAL);
-                    let info = vk::DescriptorGetInfoEXT::default()
-                        .ty(vk::DescriptorType::STORAGE_IMAGE)
-                        .data(vk::DescriptorDataEXT {
-                            p_storage_image: &ii as *const _,
-                        });
-                    let mut data = [0u8; 32];
-                    get_descriptor_device.get_descriptor(&info, &mut data);
-                    data
-                })
-                .collect();
+            let create_img_internal = |width, height, format, usage| {
+                let info = vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .extent(vk::Extent3D::default().width(width).height(height).depth(1))
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .format(format)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .initial_layout(vk::ImageLayout::GENERAL)
+                    .usage(usage)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .samples(vk::SampleCountFlags::TYPE_1);
+                let image = device.create_image(&info, None).unwrap();
 
-            let content_images = (0..2)
-                .into_iter()
-                .map(|_| {
-                    let info = vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .extent(vk::Extent3D::default().width(100).height(100).depth(1))
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .format(vk::Format::R8_UINT)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .initial_layout(vk::ImageLayout::UNDEFINED)
-                        .usage(vk::ImageUsageFlags::STORAGE)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .samples(vk::SampleCountFlags::TYPE_1);
-                    device.create_image(&info, None).unwrap()
-                })
-                .collect::<Vec<_>>();
-
-            for image in &content_images {
-                let reqs = device.get_image_memory_requirements(*image);
+                let reqs = device.get_image_memory_requirements(image);
                 let alloc_info = vk::MemoryAllocateInfo::default()
                     .allocation_size(reqs.size)
                     .memory_type_index(
@@ -465,49 +456,62 @@ impl Vk {
                         .expect("Failed to find memory type"),
                     );
                 let memory = device.allocate_memory(&alloc_info, None).unwrap();
-                device.bind_image_memory(*image, memory, 0).unwrap();
-            }
+                device.bind_image_memory(image, memory, 0).unwrap();
 
-            let content_image_views: Vec<vk::ImageView> = content_images
-                .iter()
-                .map(|&image| {
-                    let create_view_info = vk::ImageViewCreateInfo::default()
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(vk::Format::R8_UINT)
-                        .components(vk::ComponentMapping {
-                            r: vk::ComponentSwizzle::R,
-                            g: vk::ComponentSwizzle::G,
-                            b: vk::ComponentSwizzle::B,
-                            a: vk::ComponentSwizzle::A,
-                        })
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        })
-                        .image(image);
-                    device.create_image_view(&create_view_info, None).unwrap()
-                })
-                .collect();
+                let create_view_info = vk::ImageViewCreateInfo::default()
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .components(vk::ComponentMapping {
+                        r: vk::ComponentSwizzle::R,
+                        g: vk::ComponentSwizzle::G,
+                        b: vk::ComponentSwizzle::B,
+                        a: vk::ComponentSwizzle::A,
+                    })
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image(image);
+                let view = device.create_image_view(&create_view_info, None).unwrap();
 
-            let content_image_descriptors = content_image_views
-                .iter()
-                .map(|&image| {
-                    let ii = vk::DescriptorImageInfo::default()
-                        .image_view(image)
-                        .image_layout(vk::ImageLayout::GENERAL);
-                    let info = vk::DescriptorGetInfoEXT::default()
-                        .ty(vk::DescriptorType::STORAGE_IMAGE)
-                        .data(vk::DescriptorDataEXT {
-                            p_storage_image: &ii as *const _,
-                        });
-                    let mut data = [0u8; 32];
-                    get_descriptor_device.get_descriptor(&info, &mut data);
-                    data
-                })
-                .collect();
+                let ii = vk::DescriptorImageInfo::default()
+                    .image_view(view)
+                    .image_layout(vk::ImageLayout::GENERAL);
+                let info = vk::DescriptorGetInfoEXT::default()
+                    .ty(vk::DescriptorType::STORAGE_IMAGE)
+                    .data(vk::DescriptorDataEXT {
+                        p_storage_image: &ii as *const _,
+                    });
+                let mut desc = [0u8; 32];
+                get_descriptor_device.get_descriptor(&info, &mut desc);
+
+                (image, view, desc)
+            };
+
+            let create_img = |width, height| {
+                create_img_internal(
+                    width,
+                    height,
+                    vk::Format::R8_UINT,
+                    vk::ImageUsageFlags::STORAGE,
+                )
+            };
+
+            let a = create_img(100, 100);
+            let b = create_img(100, 100);
+            let (screen_image, screen_image_view, screen_image_descriptor) = create_img_internal(
+                window_width,
+                window_height,
+                surface_format.format,
+                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            );
+
+            let content_images = vec![a.0, b.0];
+            let content_image_views = vec![a.1, b.1];
+            let content_image_descriptors = vec![a.2, b.2];
 
             let content_image_sampler = {
                 let sampler_info = vk::SamplerCreateInfo::default()
@@ -516,10 +520,7 @@ impl Vk {
                     .address_mode_u(vk::SamplerAddressMode::REPEAT)
                     .address_mode_v(vk::SamplerAddressMode::REPEAT)
                     .address_mode_w(vk::SamplerAddressMode::REPEAT)
-                    .unnormalized_coordinates(false)
-                    .compare_enable(false)
-                    .compare_op(vk::CompareOp::ALWAYS)
-                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
                     .mip_lod_bias(0.0)
                     .min_lod(0.0)
                     .max_lod(0.0);
@@ -571,7 +572,9 @@ impl Vk {
                 swapchain,
                 present_images,
                 present_image_views,
-                present_image_descriptors,
+                screen_image,
+                screen_image_view,
+                screen_image_descriptor,
                 content_images,
                 content_image_views,
                 content_image_descriptors,
@@ -586,11 +589,13 @@ impl Vk {
                 surface,
                 debug_call_back,
                 debug_utils_loader,
+                screen_width: window_width,
+                screen_height: window_height,
             })
         }
     }
 
-    pub fn render_loop2<'a, F: Fn(u32) + 'a>(&'a self, f: F) -> Result<(), impl Error> {
+    pub fn render_loop2<'a, F: FnMut(u32) + 'a>(&'a self, mut f: F) -> Result<(), impl Error> {
         unsafe {
             self.render_loop(move || {
                 let (present_index, _suboptimal) = self
@@ -604,7 +609,8 @@ impl Vk {
                     .unwrap();
                 f(present_index);
 
-                /*record_submit_commandbuffer(
+                let present_image = self.present_images[present_index as usize];
+                record_submit_commandbuffer(
                     &self.device,
                     self.draw_command_buffer,
                     self.draw_commands_reuse_fence,
@@ -613,9 +619,63 @@ impl Vk {
                     &[self.present_complete_semaphore],
                     &[self.rendering_complete_semaphore],
                     |device, draw_command_buffer| {
+                        let sub_layers = vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1);
+                        let regions = [vk::ImageCopy2::default()
+                            .src_subresource(sub_layers)
+                            .dst_subresource(sub_layers)
+                            .extent(
+                                vk::Extent3D::default()
+                                    .width(self.screen_width)
+                                    .height(self.screen_height)
+                                    .depth(1),
+                            )];
                         let copy_info = vk::CopyImageInfo2::default()
-                            .src_image(src_image);
+                            .src_image(self.screen_image)
+                            .src_image_layout(vk::ImageLayout::GENERAL)
+                            .dst_image(present_image)
+                            .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                            .regions(&regions);
+
+                        let sub_range = vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1);
+                        device.cmd_pipeline_barrier(
+                            draw_command_buffer,
+                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::default(),
+                            &[],
+                            &[],
+                            &[vk::ImageMemoryBarrier::default()
+                                .old_layout(vk::ImageLayout::UNDEFINED)
+                                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .image(present_image)
+                                .subresource_range(sub_range)
+                                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)],
+                        );
                         device.cmd_copy_image2(draw_command_buffer, &copy_info);
+                        device.cmd_pipeline_barrier(
+                            draw_command_buffer,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                            vk::DependencyFlags::default(),
+                            &[],
+                            &[],
+                            &[vk::ImageMemoryBarrier::default()
+                                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .image(present_image)
+                                .subresource_range(sub_range)
+                                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                .dst_access_mask(vk::AccessFlags::empty())],
+                        );
                         /*device.cmd_begin_render_pass(
                             draw_command_buffer,
                             &render_pass_begin_info,
@@ -653,17 +713,19 @@ impl Vk {
                         device.cmd_end_render_pass(draw_command_buffer);*/
                     },
                 );
-                let wait_semaphors = [self.rendering_complete_semaphore];*/
+
+                let wait_semaphors = [self.rendering_complete_semaphore];
                 let swapchains = [self.swapchain];
                 let image_indices = [present_index];
                 let present_info = vk::PresentInfoKHR::default()
-                    // .wait_semaphores(&wait_semaphors) // &self.rendering_complete_semaphore)
+                    .wait_semaphores(&wait_semaphors) // &self.rendering_complete_semaphore)
                     .swapchains(&swapchains)
                     .image_indices(&image_indices);
 
                 self.swapchain_loader
                     .queue_present(self.present_queue, &present_info)
                     .unwrap();
+                self.device.device_wait_idle().unwrap();
             })
         }
     }
@@ -698,6 +760,16 @@ impl Drop for Vk {
             for &image_view in self.present_image_views.iter() {
                 self.device.destroy_image_view(image_view, None);
             }
+            self.device.destroy_image_view(self.screen_image_view, None);
+            self.device.destroy_image(self.screen_image, None);
+            for &image_view in self.content_image_views.iter() {
+                self.device.destroy_image_view(image_view, None);
+            }
+            for &image in self.content_images.iter() {
+                self.device.destroy_image(image, None);
+            }
+            // self.device
+            // .destroy_sampler(self.content_image_sampler, None);
             self.device.destroy_command_pool(self.pool, None);
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
