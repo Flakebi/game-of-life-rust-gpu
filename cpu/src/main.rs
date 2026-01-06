@@ -220,6 +220,11 @@ fn main() {
                 let result = hipModuleGetFunction(&mut set, module, b"set\0".as_ptr() as *const _);
                 assert_eq!(result, hipError_t::hipSuccess);
 
+                let mut check: hipFunction_t = std::ptr::null_mut();
+                let result =
+                    hipModuleGetFunction(&mut check, module, b"check\0".as_ptr() as *const _);
+                assert_eq!(result, hipError_t::hipSuccess);
+
                 let width = 100;
                 let height = 100;
                 Box::new(App {
@@ -232,6 +237,7 @@ fn main() {
                     module,
                     function,
                     set,
+                    check,
                     is_pressed: Default::default(),
                 })
             }
@@ -250,16 +256,18 @@ struct App {
     module: hipModule_t,
     function: hipFunction_t,
     set: hipFunction_t,
+    check: hipFunction_t,
     // Presset buttons and associated value (set or unset)
     is_pressed: HashMap<Option<DeviceId>, bool>,
 }
 
 impl App {
     // x and y are screen coordinates
-    fn set(&mut self, x: f64, y: f64, set: bool, win: &vk::Vk) {
+    fn set(&mut self, screen_x: f64, screen_y: f64, set: bool, win: &vk::Vk) {
         // Screen to data coordinates
-        let x = (x as f32 / self.screen_width as f32 * self.width as f32) as u32;
-        let y = (y as f32 / self.screen_height as f32 * self.height as f32) as u32;
+        let x = (screen_x as f32 / self.screen_width as f32 * self.width as f32) as u32;
+        let y = (screen_y as f32 / self.screen_height as f32 * self.height as f32) as u32;
+        println!("Set {screen_x},{screen_y} → {x},{y} = {set:?}");
 
         unsafe {
             #[allow(dead_code)]
@@ -270,7 +278,8 @@ impl App {
                 val: f32,
             }
 
-            let img = win.content_image_descriptors[self.i as usize];
+            let i = if self.paused { self.i ^ 1 } else { self.i };
+            let img = win.content_image_descriptors[i as usize];
             let kernel_args = &mut KernelArgs {
                 img,
                 x,
@@ -308,6 +317,64 @@ impl App {
             let result = hipDeviceSynchronize();
             assert_eq!(result, hipError_t::hipSuccess);
         }
+        // self.check(x, y, set, win);
+    }
+
+    fn check(&mut self, x: u32, y: u32, set: bool, win: &vk::Vk) {
+        unsafe {
+            #[allow(dead_code)]
+            struct KernelArgs {
+                img: [u8; 32],
+                sampler: [u8; 16],
+                x: u32,
+                y: u32,
+                width: u32,
+                height: u32,
+                val: f32,
+            }
+
+            let img = win.content_image_descriptors[(self.i ^ 1) as usize];
+            let sampler = win.content_image_sampler;
+            let kernel_args = &mut KernelArgs {
+                img,
+                sampler,
+                x,
+                y,
+                width: self.width,
+                height: self.height,
+                val: if set { 1.0 } else { 0.0 },
+            };
+            let mut size = std::mem::size_of_val(kernel_args);
+
+            #[allow(clippy::manual_dangling_ptr)]
+            let mut config = [
+                0x1 as *mut c_void,                          // Next come arguments
+                kernel_args as *mut _ as *mut c_void,        // Pointer to arguments
+                0x2 as *mut c_void,                          // Next comes size
+                std::ptr::addr_of_mut!(size) as *mut c_void, // Pointer to size of arguments
+                0x3 as *mut c_void,                          // End
+            ];
+
+            // println!("Launch {} {wg_x}x{wg_y}x1", args.kernel);
+            let result = hipModuleLaunchKernel(
+                self.check,
+                1,                    // Workgroup count x
+                1,                    // Workgroup count y
+                1,                    // Workgroup count z
+                1,                    // Workgroup dim x
+                1,                    // Workgroup dim y
+                1,                    // Workgroup dim z
+                0,                    // sharedMemBytes for extern shared variables
+                std::ptr::null_mut(), // stream
+                std::ptr::null_mut(), // params (unimplemented in hip)
+                config.as_mut_ptr(),  // arguments
+            );
+            assert_eq!(result, hipError_t::hipSuccess);
+
+            // println!("Wait for finish");
+            let result = hipDeviceSynchronize();
+            assert_eq!(result, hipError_t::hipSuccess);
+        }
     }
 }
 
@@ -315,7 +382,9 @@ impl vk::MyApp for App {
     fn on_render(&mut self, _: u32, win: &vk::Vk) {
         unsafe {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            self.i ^= 1;
+            if !self.paused {
+                self.i ^= 1;
+            }
             // TODO Write directly to screen image
             let screen_desc = win.screen_image_descriptor;
             let old_content_desc = win.content_image_descriptors[(self.i ^ 1) as usize];
@@ -436,7 +505,11 @@ impl vk::MyApp for App {
                 ..
             } => {
                 // Also apply on drag
-                if let Some(set) = self.is_pressed.get(&device_id) {
+                if position.x >= 0.0
+                    && position.y >= 0.0
+                // TODO Max pos
+                    && let Some(set) = self.is_pressed.get(&device_id)
+                {
                     self.set(position.x, position.y, *set, win);
                 }
             }

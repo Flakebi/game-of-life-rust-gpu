@@ -50,6 +50,9 @@ unsafe extern "unadjusted" {
     #[link_name = "llvm.amdgcn.image.store.2d.f32.i32"]
     pub fn image_store(data: f32, dmask: u32, x: u32, y: u32, img: ImageDesc, tfe: u32, aux: u32);
 
+    #[link_name = "llvm.amdgcn.image.load.2d.i32.i32"]
+    pub fn image_load(dmask: u32, x: u32, y: u32, img: ImageDesc, tfe: u32, aux: u32) -> u32;
+
     #[link_name = "llvm.amdgcn.image.store.2d.v4f32.i32"]
     pub fn image_store_color(
         data: RGBA,
@@ -72,6 +75,12 @@ struct KernelArgs {
     height: u32,
     screen_width: u32,
     screen_height: u32,
+}
+
+fn sample(img: ImageDesc, sampler: SamplerDesc, x: i32, y: i32, width: u32, height: u32) -> bool {
+    let x_f = (x as f32 + 0.5) / width as f32;
+    let y_f = (y as f32 + 0.5) / height as f32;
+    unsafe { image_sample(1, x_f, y_f, img, sampler, false, 0, 0) > 128 }
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -138,9 +147,7 @@ pub unsafe extern "gpu-kernel" fn kernel(
     }
 
     unsafe {
-        let x_f = x as f32 / width as f32;
-        let y_f = y as f32 / height as f32;
-        let val = image_sample(1, x_f, y_f, old_content_desc, sampler, false, 0, 0);
+        let val = sample(old_content_desc, sampler, x as i32, y as i32, width, height);
         if x == 0 && y == 0 {
             // println!("Got {val}");
         }
@@ -151,40 +158,38 @@ pub unsafe extern "gpu-kernel" fn kernel(
                     continue;
                 }
 
-                if image_sample(
-                    1,
-                    (x as f32 + i as f32) / width as f32,
-                    (y as f32 + j as f32) / height as f32,
+                if sample(
                     old_content_desc,
                     sampler,
-                    false,
-                    0,
-                    0,
-                ) > 128
-                {
+                    x as i32 + i,
+                    y as i32 + j,
+                    width,
+                    height,
+                ) {
                     sum += 1;
                 }
             }
         }
 
         let new_val = if paused == 1 {
-            if val > 128 { 1.0 } else { 0.0 }
+            val
         } else if sum == 3 {
             // Becomes alive
-            1.0
+            true
         } else if sum != 2 {
             // Dies
-            0.0
+            false
         } else {
-            if val > 128 { 1.0 } else { 0.0 }
+            val
         };
+        let new_val_f = if new_val { 1.0 } else { 0.0 };
 
-        image_store(new_val, 1, x, y, new_content_desc, 0, 0);
+        image_store(new_val_f, 1, x, y, new_content_desc, 0, 0);
 
         // Write screen image
-        let x_screen = (x_f * screen_width as f32) as u32;
+        let x_screen = ((x as f32 / width as f32) * screen_width as f32) as u32;
         let next_x_screen = (((x + 1) as f32 / width as f32) * screen_width as f32) as u32;
-        let y_screen = (y_f * screen_height as f32) as u32;
+        let y_screen = ((y as f32 / height as f32) * screen_height as f32) as u32;
         let next_y_screen = (((y + 1) as f32 / height as f32) * screen_height as f32) as u32;
 
         /*if x == 0 && y == 0 {
@@ -192,7 +197,7 @@ pub unsafe extern "gpu-kernel" fn kernel(
                 "Write {val} to {x_screen}..{next_x_screen} x {y_screen}..{next_y_screen} ({width}x{height} to {screen_width}x{screen_height})"
             );
         }*/
-        let col = if new_val > 0.5 {
+        let col = if new_val {
             RGBA([0.2, 0.7, 1.0, 1.0])
         } else {
             RGBA([0.0, 0.0, 0.0, 1.0])
@@ -230,5 +235,31 @@ pub unsafe extern "gpu-kernel" fn set(img: ImageDesc, x: u32, y: u32, val: f32) 
         return;
     }
 
+    // println!("GPU setting {x},{y} to {val}");
     unsafe { image_store(val, 1, x, y, img, 0, 0) };
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "gpu-kernel" fn check(
+    img: ImageDesc,
+    sampler: SamplerDesc,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    val: f32,
+) {
+    /*if workitem_id_x() != 0 || workitem_id_y() != 0 {
+        return;
+    }
+
+    let is_val = sample(img, sampler, x as i32, y as i32, width, height);
+    let is_val2 = unsafe { image_load(1, x, y, img, 0, 0) };
+    if is_val != (val == 1.0) {
+        println!("Check sample: {x},{y} is {is_val} but expected {val}");
+    }
+    if is_val2 as f32 / 255.0 != val {
+        println!("Check load: {x},{y} is {is_val2} but expected {val}");
+    }*/
 }
