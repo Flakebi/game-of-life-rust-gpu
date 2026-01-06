@@ -20,7 +20,7 @@ use winit::{
 
 pub trait MyApp {
     fn on_render(&mut self, index: u32, win: &Vk);
-    fn on_event(&mut self, event: WindowEvent, win: &Vk);
+    fn on_event(&mut self, event: WindowEvent, win: &mut Vk);
 }
 
 pub struct App {
@@ -89,14 +89,14 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => event_loop.exit(),
-            WindowEvent::SurfaceResized(_) => {
-                if let Some(vk) = &mut self.vk {
-                    vk.ensure_swapchain(true);
-                }
-            }
             e => {
                 if let Some(app) = &mut self.app {
-                    app.on_event(e, self.vk.as_ref().unwrap());
+                    app.on_event(e, self.vk.as_mut().unwrap());
+                    if self.vk.as_ref().unwrap().paused {
+                        event_loop.set_control_flow(ControlFlow::Wait);
+                    } else {
+                        event_loop.set_control_flow(ControlFlow::Poll);
+                    }
                 }
             }
         }
@@ -260,6 +260,9 @@ pub struct Vk {
 
     pub draw_commands_reuse_fence: vk::Fence,
     pub setup_commands_reuse_fence: vk::Fence,
+
+    pub tile_size: u32,
+    pub paused: bool,
 }
 
 impl Vk {
@@ -490,11 +493,13 @@ impl Vk {
                 surface,
                 debug_call_back,
                 debug_utils_loader,
+                tile_size: 16,
+                paused: false,
             })
         }
     }
 
-    fn ensure_swapchain(&mut self, force_recreate: bool) {
+    pub fn ensure_swapchain(&mut self, force_recreate: bool) {
         if self.swapchain.is_some() && !force_recreate {
             return;
         }
@@ -600,10 +605,8 @@ impl Vk {
                 )
             };
 
-            const TILE_SIZE: u32 = 16;
-
-            let width = surface_resolution.width / TILE_SIZE;
-            let height = surface_resolution.height / TILE_SIZE;
+            let width = surface_resolution.width / self.tile_size;
+            let height = surface_resolution.height / self.tile_size;
             let a = create_img(width, height);
             let b = create_img(width, height);
             let (screen_image, screen_image_view, screen_image_descriptor) = create_img_internal(

@@ -9,7 +9,9 @@ use hip_runtime_sys::{
     hipMalloc, hipMemcpyHtoD, hipModule_t, hipModuleGetFunction, hipModuleLaunchKernel,
     hipModuleLoadData, hipModuleUnload, hipRuntimeGetVersion, hipSetDevice,
 };
-use winit::event::{ButtonSource, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{
+    ButtonSource, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::keyboard::Key;
 
 mod vk;
@@ -43,7 +45,7 @@ fn get_str(s: &[i8]) -> &str {
 
 struct App {
     i: u32,
-    paused: bool,
+    sleep_ms: u64,
     module: hipModule_t,
     function: hipFunction_t,
     set: hipFunction_t,
@@ -233,7 +235,7 @@ fn main() {
 
                 Box::new(App {
                     i: 0,
-                    paused: false,
+                    sleep_ms: 100,
                     module,
                     function,
                     set,
@@ -272,7 +274,7 @@ impl App {
                 val: f32,
             }
 
-            let i = if self.paused { self.i ^ 1 } else { self.i };
+            let i = if win.paused { self.i ^ 1 } else { self.i };
             let img = win.swapchain.as_ref().unwrap().content_image_descriptors[i as usize];
             let kernel_args = &mut KernelArgs {
                 img,
@@ -376,8 +378,8 @@ impl App {
 impl vk::MyApp for App {
     fn on_render(&mut self, _: u32, win: &vk::Vk) {
         unsafe {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            if !self.paused {
+            std::thread::sleep(std::time::Duration::from_millis(self.sleep_ms));
+            if !win.paused {
                 self.i ^= 1;
             }
             // TODO Write directly to screen image
@@ -409,7 +411,7 @@ impl vk::MyApp for App {
                 height: swapchain.height,
                 window_width: swapchain.surface_resolution.width,
                 window_height: swapchain.surface_resolution.height,
-                paused: if self.paused { 1 } else { 0 },
+                paused: if win.paused { 1 } else { 0 },
             };
             let mut size = std::mem::size_of_val(kernel_args);
 
@@ -448,8 +450,9 @@ impl vk::MyApp for App {
         }
     }
 
-    fn on_event(&mut self, event: WindowEvent, win: &vk::Vk) {
+    fn on_event(&mut self, event: WindowEvent, win: &mut vk::Vk) {
         match event {
+            WindowEvent::SurfaceResized(_) => win.ensure_swapchain(true),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -458,7 +461,63 @@ impl vk::MyApp for App {
                         ..
                     },
                 ..
-            } if c.as_str() == " " => self.paused = !self.paused,
+            } if c.as_str() == " " => win.paused = !win.paused,
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        logical_key: Key::Character(c),
+                        ..
+                    },
+                ..
+            } if c.as_str() == "+" => {
+                // Make faster
+                let mut new = (self.sleep_ms as f32 * 0.9) as u64;
+                if new == self.sleep_ms && new > 1 {
+                    new -= 1;
+                }
+                if new == 0 {
+                    new = 1;
+                }
+                self.sleep_ms = new;
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        logical_key: Key::Character(c),
+                        ..
+                    },
+                ..
+            } if c.as_str() == "-" => {
+                // Make faster
+                let mut new = (self.sleep_ms as f32 * 1.1) as u64;
+                if new == self.sleep_ms {
+                    new += 1;
+                }
+                self.sleep_ms = new;
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (factor, positive) = match delta {
+                    MouseScrollDelta::LineDelta(_, d) => (1.0 + d / 10.0, d > 0.0),
+                    MouseScrollDelta::PixelDelta(d) => (1.0 + d.y as f32 / 100.0, d.y > 0.0),
+                };
+
+                let mut new = (win.tile_size as f32 * factor) as u32;
+                if new == win.tile_size {
+                    if positive {
+                        new += 1;
+                    } else if new > 1 {
+                        new -= 1;
+                    }
+                }
+                if new == 0 {
+                    new = 1;
+                }
+
+                win.tile_size = new;
+                win.ensure_swapchain(true);
+            }
             WindowEvent::PointerButton {
                 state: ElementState::Pressed,
                 button: ButtonSource::Mouse(MouseButton::Left),

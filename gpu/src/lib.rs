@@ -197,6 +197,7 @@ pub unsafe extern "gpu-kernel" fn kernel(
                 "Write {val} to {x_screen}..{next_x_screen} x {y_screen}..{next_y_screen} ({width}x{height} to {screen_width}x{screen_height})"
             );
         }*/
+        // TODO Color based on direction and age
         let col = if new_val {
             RGBA([0.2, 0.7, 1.0, 1.0])
         } else {
@@ -223,9 +224,7 @@ pub unsafe extern "gpu-kernel" fn clear(img: ImageDesc, width: u32, height: u32)
         return;
     }
 
-    let val = if y % 2 == 0 && x % 4 != 1 { 1.0 } else { 0.0 };
-
-    unsafe { image_store(val, 1, x, y, img, 0, 0) };
+    unsafe { image_store(0.0, 1, x, y, img, 0, 0) };
 }
 
 #[allow(clippy::missing_safety_doc)]
