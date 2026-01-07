@@ -271,16 +271,15 @@ impl App {
                 img: [u8; 32],
                 x: u32,
                 y: u32,
-                val: f32,
+                val: u32,
             }
 
-            let i = if win.paused { self.i ^ 1 } else { self.i };
-            let img = win.swapchain.as_ref().unwrap().content_image_descriptors[i as usize];
+            let img = win.swapchain.as_ref().unwrap().content_image_descriptors[self.i as usize];
             let kernel_args = &mut KernelArgs {
                 img,
                 x,
                 y,
-                val: if set { 1.0 } else { 0.0 },
+                val: if set { 1 } else { 0 },
             };
             let mut size = std::mem::size_of_val(kernel_args);
 
@@ -379,14 +378,14 @@ impl vk::MyApp for App {
     fn on_render(&mut self, _: u32, win: &vk::Vk) {
         unsafe {
             std::thread::sleep(std::time::Duration::from_millis(self.sleep_ms));
-            if !win.paused {
-                self.i ^= 1;
-            }
             // TODO Write directly to screen image
             let swapchain = win.swapchain.as_ref().unwrap();
             let screen_desc = swapchain.screen_image_descriptor;
-            let old_content_desc = swapchain.content_image_descriptors[(self.i ^ 1) as usize];
-            let new_content_desc = swapchain.content_image_descriptors[self.i as usize];
+            let old_content_desc = swapchain.content_image_descriptors[self.i as usize];
+            let new_content_desc = swapchain.content_image_descriptors[(self.i ^ 1) as usize];
+            if !win.paused {
+                self.i ^= 1;
+            }
             let sampler = win.content_image_sampler;
 
             #[allow(dead_code)]

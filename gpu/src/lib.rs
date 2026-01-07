@@ -77,10 +77,15 @@ struct KernelArgs {
     screen_height: u32,
 }
 
-fn sample(img: ImageDesc, sampler: SamplerDesc, x: i32, y: i32, width: u32, height: u32) -> bool {
+fn sample(img: ImageDesc, sampler: SamplerDesc, x: i32, y: i32, width: u32, height: u32) -> u32 {
     let x_f = (x as f32 + 0.5) / width as f32;
     let y_f = (y as f32 + 0.5) / height as f32;
-    unsafe { image_sample(1, x_f, y_f, img, sampler, false, 0, 0) > 128 }
+    unsafe { image_sample(1, x_f, y_f, img, sampler, false, 0, 0) }
+}
+
+fn store(img: ImageDesc, x: u32, y: u32, val: u32) {
+    let val_f = f32::from_bits(val);
+    unsafe { image_store(val_f, 1, x, y, img, 0, 0) };
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -148,9 +153,18 @@ pub unsafe extern "gpu-kernel" fn kernel(
 
     unsafe {
         let val = sample(old_content_desc, sampler, x as i32, y as i32, width, height);
+        // value is saved as direction (lower 3 bits) + age (upper 5 bits)
+        let dir = val & 7;
+        let age = val >> 3;
+        const MAX_AGE: f32 = 31.0;
+
+        // let val2 = image_load(1, x, y, old_content_desc, 0, 0);
         if x == 0 && y == 0 {
-            // println!("Got {val}");
+            // println!("Got {val} or {val2}");
         }
+
+        let mut new_dir_x = 0;
+        let mut new_dir_y = 0;
         let mut sum = 0;
         for i in -1..=1 {
             for j in -1..=1 {
@@ -165,26 +179,44 @@ pub unsafe extern "gpu-kernel" fn kernel(
                     y as i32 + j,
                     width,
                     height,
-                ) {
+                ) != 0
+                {
                     sum += 1;
+                    new_dir_x += i;
+                    new_dir_y += j;
                 }
             }
         }
-
-        let new_val = if paused == 1 {
-            val
-        } else if sum == 3 {
-            // Becomes alive
-            true
-        } else if sum != 2 {
-            // Dies
-            false
+        new_dir_x = new_dir_x.clamp(-1, 1);
+        new_dir_y = new_dir_y.clamp(-1, 1);
+        let new_dir = if age != 0 {
+            // Keep dir
+            dir
         } else {
-            val
+            (new_dir_x + 1) as u32 + ((new_dir_y + 1) << 1) as u32
         };
-        let new_val_f = if new_val { 1.0 } else { 0.0 };
 
-        image_store(new_val_f, 1, x, y, new_content_desc, 0, 0);
+        let new_age = if paused == 1 {
+            age
+        } else if age == 0 {
+            if sum == 3 {
+                // Becomes alive
+                1
+            } else {
+                0
+            }
+        } else if sum == 2 || sum == 3 {
+            // Increment age, cap at 255
+            31.min(age + 1)
+        } else {
+            // Dies
+            0
+        };
+        let mut new_val = new_age << 3;
+        if new_age != 0 {
+            new_val |= new_dir;
+        }
+        store(new_content_desc, x, y, new_val);
 
         // Write screen image
         let x_screen = ((x as f32 / width as f32) * screen_width as f32) as u32;
@@ -197,11 +229,21 @@ pub unsafe extern "gpu-kernel" fn kernel(
                 "Write {val} to {x_screen}..{next_x_screen} x {y_screen}..{next_y_screen} ({width}x{height} to {screen_width}x{screen_height})"
             );
         }*/
-        // TODO Color based on direction and age
-        let col = if new_val {
-            RGBA([0.2, 0.7, 1.0, 1.0])
-        } else {
+        // Color based on direction
+        let red = 0.7 * (new_dir >> 1) as f32 / 3.0;
+        let green = 0.7 * (new_dir & 3) as f32 / 3.0;
+
+        let col = if new_age == 0 {
             RGBA([0.0, 0.0, 0.0, 1.0])
+        } else if new_age <= 5 {
+            RGBA([red, green, 1.0 - (new_age - 1) as f32 / 4.0 * 0.4, 1.0])
+        } else {
+            // Steep linear gradient in the beginning, then cubic
+            let mut v = new_age as f32 / MAX_AGE - 1.0;
+            v = v * v;
+            v = v * v;
+            let age_ratio = v;
+            RGBA([red, green, age_ratio * 0.5 + 0.1, 1.0])
         };
         for i in x_screen..next_x_screen {
             for j in y_screen..next_y_screen {
@@ -224,18 +266,18 @@ pub unsafe extern "gpu-kernel" fn clear(img: ImageDesc, width: u32, height: u32)
         return;
     }
 
-    unsafe { image_store(0.0, 1, x, y, img, 0, 0) };
+    store(img, x, y, 0);
 }
 
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
-pub unsafe extern "gpu-kernel" fn set(img: ImageDesc, x: u32, y: u32, val: f32) {
+pub unsafe extern "gpu-kernel" fn set(img: ImageDesc, x: u32, y: u32, val: u32) {
     if workitem_id_x() != 0 || workitem_id_y() != 0 {
         return;
     }
 
     // println!("GPU setting {x},{y} to {val}");
-    unsafe { image_store(val, 1, x, y, img, 0, 0) };
+    store(img, x, y, val << 3);
 }
 
 #[allow(unused_variables, clippy::missing_safety_doc)]
