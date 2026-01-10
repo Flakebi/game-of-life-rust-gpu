@@ -12,7 +12,7 @@ use hip_runtime_sys::{
 use winit::event::{
     ButtonSource, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
 };
-use winit::keyboard::Key;
+use winit::keyboard::{Key, NamedKey};
 
 mod vk;
 
@@ -50,7 +50,7 @@ struct App {
     function: hipFunction_t,
     set: hipFunction_t,
     check: hipFunction_t,
-    // Presset buttons and associated value (set or unset)
+    /// Pressed buttons and associated value (set or unset tile)
     is_pressed: HashMap<Option<DeviceId>, bool>,
 }
 
@@ -126,25 +126,6 @@ fn main() {
                 let mut device = 0;
                 let result = hipGetDevice(&mut device);
                 assert_eq!(result, hipError_t::hipSuccess);
-
-                // Allocate two buffers on the GPU for double buffering
-                /*println!("Alloc memory");
-                let mut a_device: hipDeviceptr_t = std::ptr::null_mut();
-                let mut b_device: hipDeviceptr_t = std::ptr::null_mut();
-                let result = hipMalloc(&mut a_device, size as usize);
-                assert_eq!(result, hipError_t::hipSuccess);
-                let result = hipMalloc(&mut b_device, size as usize);
-                assert_eq!(result, hipError_t::hipSuccess);
-
-                // Copy a to GPU buffers
-                let mut a = vec![0u8; size as usize];
-                println!(
-                    "Copy memory from {:?} (cpu) to {:?} (gpu)",
-                    a.as_ptr(),
-                    a_device
-                );
-                let result = hipMemcpyHtoD(a_device, a.as_mut_ptr() as *mut c_void, size as usize);
-                assert_eq!(result, hipError_t::hipSuccess);*/
 
                 // Load the executable that was compiled for the GPU
                 println!("Load module from {}", args.file.display());
@@ -372,13 +353,49 @@ impl App {
             assert_eq!(result, hipError_t::hipSuccess);
         }
     }
+
+    fn make_faster(&mut self) {
+        let mut new = (self.sleep_ms as f32 * 0.9) as u64;
+        if new == self.sleep_ms && new > 1 {
+            new -= 1;
+        }
+        if new == 0 {
+            new = 1;
+        }
+        self.sleep_ms = new;
+    }
+
+    fn make_slower(&mut self) {
+        let mut new = (self.sleep_ms as f32 * 1.1) as u64;
+        if new == self.sleep_ms {
+            new += 1;
+        }
+        self.sleep_ms = new;
+    }
+
+    /// Zoom in or out
+    fn zoom(&mut self, factor: f32, positive: bool, win: &mut vk::Vk) {
+        let mut new = (win.tile_size as f32 * factor) as u32;
+        if new == win.tile_size {
+            if positive {
+                new += 1;
+            } else if new > 1 {
+                new -= 1;
+            }
+        }
+        if new == 0 {
+            new = 1;
+        }
+
+        win.tile_size = new;
+        win.ensure_swapchain(true);
+    }
 }
 
 impl vk::MyApp for App {
     fn on_render(&mut self, _: u32, win: &vk::Vk) {
         unsafe {
             std::thread::sleep(std::time::Duration::from_millis(self.sleep_ms));
-            // TODO Write directly to screen image
             let swapchain = win.swapchain.as_ref().unwrap();
             let screen_desc = swapchain.screen_image_descriptor;
             let old_content_desc = swapchain.content_image_descriptors[self.i as usize];
@@ -469,17 +486,16 @@ impl vk::MyApp for App {
                         ..
                     },
                 ..
-            } if c.as_str() == "+" => {
-                // Make faster
-                let mut new = (self.sleep_ms as f32 * 0.9) as u64;
-                if new == self.sleep_ms && new > 1 {
-                    new -= 1;
-                }
-                if new == 0 {
-                    new = 1;
-                }
-                self.sleep_ms = new;
-            }
+            } if c.as_str() == "+" || c.as_str() == "." => self.make_faster(),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        logical_key: Key::Named(NamedKey::ArrowRight),
+                        ..
+                    },
+                ..
+            } => self.make_faster(),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -488,35 +504,42 @@ impl vk::MyApp for App {
                         ..
                     },
                 ..
-            } if c.as_str() == "-" => {
-                // Make faster
-                let mut new = (self.sleep_ms as f32 * 1.1) as u64;
-                if new == self.sleep_ms {
-                    new += 1;
-                }
-                self.sleep_ms = new;
-            }
+            } if c.as_str() == "-" || c.as_str() == "," => self.make_slower(),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        logical_key: Key::Named(NamedKey::ArrowLeft),
+                        ..
+                    },
+                ..
+            } => self.make_slower(),
             WindowEvent::MouseWheel { delta, .. } => {
                 let (factor, positive) = match delta {
                     MouseScrollDelta::LineDelta(_, d) => (1.0 + d / 10.0, d > 0.0),
                     MouseScrollDelta::PixelDelta(d) => (1.0 + d.y as f32 / 100.0, d.y > 0.0),
                 };
 
-                let mut new = (win.tile_size as f32 * factor) as u32;
-                if new == win.tile_size {
-                    if positive {
-                        new += 1;
-                    } else if new > 1 {
-                        new -= 1;
-                    }
-                }
-                if new == 0 {
-                    new = 1;
-                }
-
-                win.tile_size = new;
-                win.ensure_swapchain(true);
+                self.zoom(factor, positive, win);
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        logical_key: Key::Named(NamedKey::ArrowUp),
+                        ..
+                    },
+                ..
+            } => self.zoom(1.1, true, win),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        logical_key: Key::Named(NamedKey::ArrowDown),
+                        ..
+                    },
+                ..
+            } => self.zoom(0.9, false, win),
             WindowEvent::PointerButton {
                 state: ElementState::Pressed,
                 button: ButtonSource::Mouse(MouseButton::Left),
@@ -574,28 +597,13 @@ impl vk::MyApp for App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        /*println!("Copy memory back");
-        let result = hipMemcpyDtoH(
-            &mut output as *mut u32 as *mut c_void,
-            output_device,
-            mem::size_of_val(&output),
-        );
-        assert_eq!(result, hipError_t::hipSuccess);
-
-        // Print result
-        println!("Output: {}", output);*/
-
         unsafe {
             println!("Free");
             let result = hipModuleUnload(self.module);
             assert_eq!(result, hipError_t::hipSuccess);
-            /*let result = hipFree(a_device);
-            assert_eq!(result, hipError_t::hipSuccess);
-            let result = hipFree(b_device);
-            assert_eq!(result, hipError_t::hipSuccess);*/
         }
 
-        // win.clear();
+        // TODO win.clear();
         println!("Finished");
     }
 }
