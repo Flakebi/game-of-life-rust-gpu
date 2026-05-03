@@ -1,13 +1,16 @@
+//! The CPU code that sets up a window, handles input and launches the GPU kernel for the
+//! simulation.
+
 use std::collections::HashMap;
-use std::ffi::{CString, c_void};
+use std::ffi::c_void;
 use std::path::PathBuf;
 
 use clap::Parser;
 use hip_runtime_sys::{
-    hipDeviceProp_t, hipDeviceSynchronize, hipDeviceptr_t, hipDriverGetVersion, hipError_t,
-    hipFree, hipFunction_t, hipGetDevice, hipGetDeviceCount, hipGetDeviceProperties, hipInit,
-    hipMalloc, hipMemcpyHtoD, hipModule_t, hipModuleGetFunction, hipModuleLaunchKernel,
-    hipModuleLoadData, hipModuleUnload, hipRuntimeGetVersion, hipSetDevice,
+    hipDeviceProp_t, hipDeviceSynchronize, hipDriverGetVersion, hipError_t, hipFunction_t,
+    hipGetDevice, hipGetDeviceCount, hipGetDeviceProperties, hipInit, hipModule_t,
+    hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoadData, hipModuleUnload,
+    hipRuntimeGetVersion, hipSetDevice,
 };
 use winit::event::{
     ButtonSource, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
@@ -30,10 +33,6 @@ struct Cli {
     /// Index of the device to use
     #[arg(short, long, default_value_t = 0)]
     device_index: i32,
-
-    /// Name of the kernel
-    #[arg(short, long, default_value = "kernel")]
-    kernel: String,
 }
 
 fn get_str(s: &[i8]) -> &str {
@@ -44,13 +43,21 @@ fn get_str(s: &[i8]) -> &str {
 }
 
 struct App {
-    i: u32,
+    /// The current index into the images.
+    /// One image is used for reading the state, the other is written to.
+    /// Flips between 0 and 1 every frame.
+    image_index: u32,
+    /// How long to sleep between frames.
+    /// Allows to change the speed of the simulation.
     sleep_ms: u64,
+    /// The compiled module with the GPU kernel
     module: hipModule_t,
-    function: hipFunction_t,
+    /// The kernel that runs a simulation step
+    simulate: hipFunction_t,
+    /// The kernel that sets a cell to a specified value
     set: hipFunction_t,
-    check: hipFunction_t,
-    /// Pressed buttons and associated value (set or unset tile)
+    /// Pressed buttons and associated value (set or unset tile).
+    /// Used for drawing on the field.
     is_pressed: HashMap<Option<DeviceId>, bool>,
 }
 
@@ -116,10 +123,13 @@ fn main() {
     }
 
     let app = vk::App::new(
+        // Default window dimensions
         1000,
         800,
+        // Initialization when the window is available
         Box::new(move |win| {
             unsafe {
+                // Set the default device, all device-specific functions will use this one
                 println!("Set device {}", args.device_index);
                 let result = hipSetDevice(args.device_index);
                 assert_eq!(result, hipError_t::hipSuccess);
@@ -135,12 +145,13 @@ fn main() {
                 assert_eq!(result, hipError_t::hipSuccess);
 
                 // Get kernel function from loaded module
-                println!("Get function {}", args.kernel);
-                let mut function: hipFunction_t = std::ptr::null_mut();
-                let kernel_name = CString::new(args.kernel.clone()).expect("Invalid kernel name");
-                let result = hipModuleGetFunction(&mut function, module, kernel_name.as_ptr());
+                println!("Get function kernel");
+                let mut simulate: hipFunction_t = std::ptr::null_mut();
+                let result =
+                    hipModuleGetFunction(&mut simulate, module, b"kernel\0".as_ptr() as *const _);
                 assert_eq!(result, hipError_t::hipSuccess);
 
+                /// Argument struct for the `clear` GPU function
                 #[allow(dead_code)]
                 struct ClearKernelArgs {
                     image_desc: [u8; 32],
@@ -148,21 +159,14 @@ fn main() {
                     height: u32,
                 }
 
-                #[allow(dead_code)]
-                struct SetKernelArgs {
-                    image_desc: [u8; 32],
-                    x: u32,
-                    y: u32,
-                    val: f32,
-                }
-
-                // Clear image
+                // Get kernel to clear/initialize image to all 0
                 println!("Get function clear");
                 let mut clear: hipFunction_t = std::ptr::null_mut();
                 let result =
                     hipModuleGetFunction(&mut clear, module, b"clear\0".as_ptr() as *const _);
                 assert_eq!(result, hipError_t::hipSuccess);
 
+                // Run clear kernel for the two field images
                 let swapchain = win.swapchain.as_ref().unwrap();
                 for image in &swapchain.content_image_descriptors {
                     let kernel_args = &mut ClearKernelArgs {
@@ -182,7 +186,7 @@ fn main() {
                     ];
 
                     const WG_SIZE: u32 = 16;
-                    // Launch two workgroups (2x1x1), each of the size 16x16x1
+                    // Launch workgroups of size 16x16x1 to fill the image
                     let wg_x = swapchain.width.div_ceil(WG_SIZE);
                     let wg_y = swapchain.height.div_ceil(WG_SIZE);
                     let result = hipModuleLaunchKernel(
@@ -205,22 +209,17 @@ fn main() {
                 }
                 println!("Images cleared");
 
+                // Get kernel to set a cell
                 let mut set: hipFunction_t = std::ptr::null_mut();
                 let result = hipModuleGetFunction(&mut set, module, b"set\0".as_ptr() as *const _);
                 assert_eq!(result, hipError_t::hipSuccess);
 
-                let mut check: hipFunction_t = std::ptr::null_mut();
-                let result =
-                    hipModuleGetFunction(&mut check, module, b"check\0".as_ptr() as *const _);
-                assert_eq!(result, hipError_t::hipSuccess);
-
                 Box::new(App {
-                    i: 0,
+                    image_index: 0,
                     sleep_ms: 100,
                     module,
-                    function,
+                    simulate,
                     set,
-                    check,
                     is_pressed: Default::default(),
                 })
             }
@@ -230,21 +229,17 @@ fn main() {
 }
 
 impl App {
-    // x and y are screen coordinates
+    /// Set or clear a cell on the field.
+    ///
+    /// Coordinates given in screen space are transformed to cell coordinates first.
+    /// `set` specifies if the cell should be marked alive or dead.
     fn set(&mut self, screen_x: f64, screen_y: f64, set: bool, win: &vk::Vk) {
-        // Screen to data coordinates
+        // Screen to field coordinates
         let swapchain = win.swapchain.as_ref().unwrap();
         let x = (screen_x as f32 / swapchain.surface_resolution.width as f32
             * swapchain.width as f32) as u32;
         let y = (screen_y as f32 / swapchain.surface_resolution.height as f32
             * swapchain.height as f32) as u32;
-        /*println!(
-            "Set {screen_x},{screen_y} (of {},{}) → {x},{y} (of {},{}) = {set:?}",
-            swapchain.surface_resolution.width,
-            swapchain.surface_resolution.height,
-            swapchain.width,
-            swapchain.height
-        );*/
 
         unsafe {
             #[allow(dead_code)]
@@ -255,7 +250,8 @@ impl App {
                 val: u32,
             }
 
-            let img = win.swapchain.as_ref().unwrap().content_image_descriptors[self.i as usize];
+            let img = win.swapchain.as_ref().unwrap().content_image_descriptors
+                [self.image_index as usize];
             let kernel_args = &mut KernelArgs {
                 img,
                 x,
@@ -273,7 +269,6 @@ impl App {
                 0x3 as *mut c_void,                          // End
             ];
 
-            // println!("Launch {} {wg_x}x{wg_y}x1", args.kernel);
             let result = hipModuleLaunchKernel(
                 self.set,
                 1,                    // Workgroup count x
@@ -289,71 +284,12 @@ impl App {
             );
             assert_eq!(result, hipError_t::hipSuccess);
 
-            // println!("Wait for finish");
-            let result = hipDeviceSynchronize();
-            assert_eq!(result, hipError_t::hipSuccess);
-        }
-        // self.check(x, y, set, win);
-    }
-
-    fn check(&mut self, x: u32, y: u32, set: bool, win: &vk::Vk) {
-        unsafe {
-            #[allow(dead_code)]
-            struct KernelArgs {
-                img: [u8; 32],
-                sampler: [u8; 16],
-                x: u32,
-                y: u32,
-                width: u32,
-                height: u32,
-                val: f32,
-            }
-
-            let swapchain = win.swapchain.as_ref().unwrap();
-            let img = swapchain.content_image_descriptors[(self.i ^ 1) as usize];
-            let sampler = win.content_image_sampler;
-            let kernel_args = &mut KernelArgs {
-                img,
-                sampler,
-                x,
-                y,
-                width: swapchain.width,
-                height: swapchain.height,
-                val: if set { 1.0 } else { 0.0 },
-            };
-            let mut size = std::mem::size_of_val(kernel_args);
-
-            #[allow(clippy::manual_dangling_ptr)]
-            let mut config = [
-                0x1 as *mut c_void,                          // Next come arguments
-                kernel_args as *mut _ as *mut c_void,        // Pointer to arguments
-                0x2 as *mut c_void,                          // Next comes size
-                std::ptr::addr_of_mut!(size) as *mut c_void, // Pointer to size of arguments
-                0x3 as *mut c_void,                          // End
-            ];
-
-            // println!("Launch {} {wg_x}x{wg_y}x1", args.kernel);
-            let result = hipModuleLaunchKernel(
-                self.check,
-                1,                    // Workgroup count x
-                1,                    // Workgroup count y
-                1,                    // Workgroup count z
-                1,                    // Workgroup dim x
-                1,                    // Workgroup dim y
-                1,                    // Workgroup dim z
-                0,                    // sharedMemBytes for extern shared variables
-                std::ptr::null_mut(), // stream
-                std::ptr::null_mut(), // params (unimplemented in hip)
-                config.as_mut_ptr(),  // arguments
-            );
-            assert_eq!(result, hipError_t::hipSuccess);
-
-            // println!("Wait for finish");
             let result = hipDeviceSynchronize();
             assert_eq!(result, hipError_t::hipSuccess);
         }
     }
 
+    /// Speed up the simulation by reducing the sleep time between frames.
     fn make_faster(&mut self) {
         let mut new = (self.sleep_ms as f32 * 0.9) as u64;
         if new == self.sleep_ms && new > 1 {
@@ -365,6 +301,7 @@ impl App {
         self.sleep_ms = new;
     }
 
+    /// Slow down the simulation by increasing the sleep time between frames.
     fn make_slower(&mut self) {
         let mut new = (self.sleep_ms as f32 * 1.1) as u64;
         if new == self.sleep_ms {
@@ -373,11 +310,14 @@ impl App {
         self.sleep_ms = new;
     }
 
-    /// Zoom in or out
-    fn zoom(&mut self, factor: f32, positive: bool, win: &mut vk::Vk) {
+    /// Zoom in or out the field.
+    ///
+    /// The field is always fully displayed in the window, so this changes the size of the field.
+    fn zoom(&mut self, factor: f32, win: &mut vk::Vk) {
         let mut new = (win.tile_size as f32 * factor) as u32;
         if new == win.tile_size {
-            if positive {
+            // If the tile size is unchanged by the factor, increase/decrease by one
+            if factor > 1.0 {
                 new += 1;
             } else if new > 1 {
                 new -= 1;
@@ -393,15 +333,18 @@ impl App {
 }
 
 impl vk::MyApp for App {
+    /// Simulate a single step and display the field
     fn on_render(&mut self, _: u32, win: &vk::Vk) {
         unsafe {
             std::thread::sleep(std::time::Duration::from_millis(self.sleep_ms));
             let swapchain = win.swapchain.as_ref().unwrap();
+            // Get image descriptors
             let screen_desc = swapchain.screen_image_descriptor;
-            let old_content_desc = swapchain.content_image_descriptors[self.i as usize];
-            let new_content_desc = swapchain.content_image_descriptors[(self.i ^ 1) as usize];
+            let old_content_desc = swapchain.content_image_descriptors[self.image_index as usize];
+            let new_content_desc =
+                swapchain.content_image_descriptors[(self.image_index ^ 1) as usize];
             if !win.paused {
-                self.i ^= 1;
+                self.image_index ^= 1;
             }
             let sampler = win.content_image_sampler;
 
@@ -415,7 +358,6 @@ impl vk::MyApp for App {
                 height: u32,
                 window_width: u32,
                 window_height: u32,
-                paused: u32,
             }
 
             let kernel_args = &mut KernelArgs {
@@ -427,7 +369,6 @@ impl vk::MyApp for App {
                 height: swapchain.height,
                 window_width: swapchain.surface_resolution.width,
                 window_height: swapchain.surface_resolution.height,
-                paused: if win.paused { 1 } else { 0 },
             };
             let mut size = std::mem::size_of_val(kernel_args);
 
@@ -441,12 +382,11 @@ impl vk::MyApp for App {
             ];
 
             const WG_SIZE: u32 = 16;
-            // Launch two workgroups (2x1x1), each of the size 16x16x1
+            // Launch workgroups of size 16x16x1
             let wg_x = swapchain.width.div_ceil(WG_SIZE);
             let wg_y = swapchain.height.div_ceil(WG_SIZE);
-            // println!("Launch {} {wg_x}x{wg_y}x1", args.kernel);
             let result = hipModuleLaunchKernel(
-                self.function,
+                self.simulate,
                 wg_x,                 // Workgroup count x
                 wg_y,                 // Workgroup count y
                 1,                    // Workgroup count z
@@ -460,12 +400,12 @@ impl vk::MyApp for App {
             );
             assert_eq!(result, hipError_t::hipSuccess);
 
-            // println!("Wait for finish");
             let result = hipDeviceSynchronize();
             assert_eq!(result, hipError_t::hipSuccess);
         }
     }
 
+    /// Handle mouse and keyboard events
     fn on_event(&mut self, event: WindowEvent, win: &mut vk::Vk) {
         match event {
             WindowEvent::SurfaceResized(_) => win.ensure_swapchain(true),
@@ -515,12 +455,12 @@ impl vk::MyApp for App {
                 ..
             } => self.make_slower(),
             WindowEvent::MouseWheel { delta, .. } => {
-                let (factor, positive) = match delta {
-                    MouseScrollDelta::LineDelta(_, d) => (1.0 + d / 10.0, d > 0.0),
-                    MouseScrollDelta::PixelDelta(d) => (1.0 + d.y as f32 / 100.0, d.y > 0.0),
+                let factor = match delta {
+                    MouseScrollDelta::LineDelta(_, d) => 1.0 + d / 10.0,
+                    MouseScrollDelta::PixelDelta(d) => 1.0 + d.y as f32 / 100.0,
                 };
 
-                self.zoom(factor, positive, win);
+                self.zoom(factor, win);
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -530,7 +470,7 @@ impl vk::MyApp for App {
                         ..
                     },
                 ..
-            } => self.zoom(1.1, true, win),
+            } => self.zoom(1.1, win),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -539,7 +479,7 @@ impl vk::MyApp for App {
                         ..
                     },
                 ..
-            } => self.zoom(0.9, false, win),
+            } => self.zoom(0.9, win),
             WindowEvent::PointerButton {
                 state: ElementState::Pressed,
                 button: ButtonSource::Mouse(MouseButton::Left),
@@ -603,7 +543,6 @@ impl Drop for App {
             assert_eq!(result, hipError_t::hipSuccess);
         }
 
-        // TODO win.clear();
         println!("Finished");
     }
 }

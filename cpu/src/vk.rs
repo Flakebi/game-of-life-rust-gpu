@@ -1,7 +1,14 @@
+//! Vulkan code to create a window, allocate images, and so on.
+//!
+//! It does not run any shaders, we extract the raw descriptors for the images and do the rendering
+//! in the Rust GPU kernels. The image written by the kernel is copied to the framebuffer.
+
+#[cfg(debug_assertions)]
+use std::borrow::Cow;
 use std::default::Default;
 use std::error::Error;
 use std::ffi;
-use std::{borrow::Cow, ops::Drop, os::raw::c_char};
+use std::{ops::Drop, os::raw::c_char};
 
 use ash::vk;
 use ash::{
@@ -54,6 +61,7 @@ impl App {
 }
 
 impl ApplicationHandler for App {
+    /// Called when we are ready to create the window
     fn can_create_surfaces(&mut self, event_loop: &dyn winit::event_loop::ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Poll);
         let window = event_loop
@@ -72,6 +80,7 @@ impl ApplicationHandler for App {
         self.app = Some(self.create_app.take().unwrap()(self.vk.as_ref().unwrap()));
     }
 
+    /// Handle window events
     fn window_event(
         &mut self,
         event_loop: &dyn winit::event_loop::ActiveEventLoop,
@@ -90,6 +99,7 @@ impl ApplicationHandler for App {
                 ..
             } => event_loop.exit(),
             e => {
+                // Pass everything else to the app
                 if let Some(app) = &mut self.app {
                     app.on_event(e, self.vk.as_mut().unwrap());
                     if self.vk.as_ref().unwrap().paused {
@@ -102,6 +112,7 @@ impl ApplicationHandler for App {
         }
     }
 
+    /// Render when no more events are outstanding
     fn about_to_wait(&mut self, _: &dyn winit::event_loop::ActiveEventLoop) {
         if let Some(vk) = &mut self.vk {
             vk.render(|i, vk| self.app.as_mut().unwrap().on_render(i, vk));
@@ -164,6 +175,8 @@ pub fn record_submit_commandbuffer<F: FnOnce(&Device, vk::CommandBuffer)>(
     }
 }
 
+/// Print a vulkan message
+#[cfg(debug_assertions)]
 unsafe extern "system" fn vulkan_debug_callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     message_type: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -207,26 +220,39 @@ pub fn find_memorytype_index(
         .map(|(index, _memory_type)| index as _)
 }
 
-// Everything dependent on window/swapchain size
+/// Everything dependent on window/swapchain size.
+///
+/// This gets recreated when the window size changes.
 pub struct Swapchain {
+    /// Resolution of the framebuffer/swapchain
     pub surface_resolution: vk::Extent2D,
     pub swapchain: vk::SwapchainKHR,
+    /// Memory for the framebuffer images
     pub present_images: Vec<vk::Image>,
+    /// Descriptors for the framebuffer images
     pub present_image_views: Vec<vk::ImageView>,
 
+    /// The image that the Rust GPU code stores to
     pub screen_image: vk::Image,
+    /// Descriptor for `screen_image`
     pub screen_image_view: vk::ImageView,
+    /// Raw descriptor for `screen_image`
     pub screen_image_descriptor: [u8; 32],
 
-    // Images containing game of life
+    /// Images containing the game of life field
     pub content_images: Vec<vk::Image>,
+    /// Descriptors for `content_images`
     pub content_image_views: Vec<vk::ImageView>,
+    /// Raw descriptors for `content_images`
     pub content_image_descriptors: Vec<[u8; 32]>,
 
+    /// Width of the game of life field
     pub width: u32,
+    /// Height of the game of life field
     pub height: u32,
 }
 
+/// All Vulkan data
 #[allow(dead_code)]
 pub struct Vk {
     pub entry: Entry,
@@ -234,8 +260,11 @@ pub struct Vk {
     pub device: Device,
     pub surface_loader: surface::Instance,
     pub swapchain_loader: swapchain::Device,
+    #[cfg(debug_assertions)]
     pub debug_utils_loader: debug_utils::Instance,
+    /// Window dependent data
     pub window: Box<dyn Window>,
+    #[cfg(debug_assertions)]
     pub debug_call_back: vk::DebugUtilsMessengerEXT,
 
     pub pdevice: vk::PhysicalDevice,
@@ -247,8 +276,10 @@ pub struct Vk {
     pub surface: vk::SurfaceKHR,
     pub surface_format: vk::SurfaceFormatKHR,
 
+    /// Resolution dependent data
     pub swapchain: Option<Swapchain>,
 
+    /// Raw descriptor of the sampler for reading the game of life field
     pub content_image_sampler: [u8; 16],
 
     pub pool: vk::CommandPool,
@@ -266,6 +297,7 @@ pub struct Vk {
 }
 
 impl Vk {
+    /// Vulkan setup code for devices, extensions, etc.
     pub fn new(window: Box<dyn Window>) -> Result<Self, Box<dyn Error>> {
         unsafe {
             let entry = Entry::load().expect("Failed to load Vulkan");
@@ -304,6 +336,7 @@ impl Vk {
                 .create_instance(&create_info, None)
                 .expect("Instance creation error");
 
+            #[cfg(debug_assertions)]
             let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
                 .message_severity(
                     vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
@@ -317,10 +350,13 @@ impl Vk {
                 )
                 .pfn_user_callback(Some(vulkan_debug_callback));
 
+            #[cfg(debug_assertions)]
             let debug_utils_loader = debug_utils::Instance::new(&entry, &instance);
+            #[cfg(debug_assertions)]
             let debug_call_back = debug_utils_loader
                 .create_debug_utils_messenger(&debug_info, None)
                 .unwrap();
+
             let surface = ash_window::create_surface(
                 &entry,
                 &instance,
@@ -426,6 +462,7 @@ impl Vk {
             let device_memory_properties = instance.get_physical_device_memory_properties(pdevice);
             let get_descriptor_device = descriptor_buffer::Device::new(&instance, &device);
 
+            // Create the sampler used to load from the previous game of life field
             let content_image_sampler = {
                 let sampler_info = vk::SamplerCreateInfo::default()
                     .address_mode_u(vk::SamplerAddressMode::REPEAT)
@@ -485,7 +522,9 @@ impl Vk {
                 draw_commands_reuse_fence,
                 setup_commands_reuse_fence,
                 surface,
+                #[cfg(debug_assertions)]
                 debug_call_back,
+                #[cfg(debug_assertions)]
                 debug_utils_loader,
                 tile_size: 16,
                 paused: false,
@@ -493,6 +532,9 @@ impl Vk {
         }
     }
 
+    /// Vulkan setup code to create a swapchain.
+    ///
+    /// Also used to recreate one when the resolution changes.
     pub fn ensure_swapchain(&mut self, force_recreate: bool) {
         if self.swapchain.is_some() && !force_recreate {
             return;
@@ -524,7 +566,10 @@ impl Vk {
 
             let get_descriptor_device =
                 descriptor_buffer::Device::new(&self.instance, &self.device);
+
+            // Create an image and return a tuple of (image, view, raw descriptor)
             let create_img_internal = |width, height, format, usage| {
+                // Create an image
                 let info = vk::ImageCreateInfo::default()
                     .image_type(vk::ImageType::TYPE_2D)
                     .extent(vk::Extent3D::default().width(width).height(height).depth(1))
@@ -538,6 +583,7 @@ impl Vk {
                     .samples(vk::SampleCountFlags::TYPE_1);
                 let image = self.device.create_image(&info, None).unwrap();
 
+                // Allocate memory
                 let reqs = self.device.get_image_memory_requirements(image);
                 let alloc_info = vk::MemoryAllocateInfo::default()
                     .allocation_size(reqs.size)
@@ -552,6 +598,7 @@ impl Vk {
                 let memory = self.device.allocate_memory(&alloc_info, None).unwrap();
                 self.device.bind_image_memory(image, memory, 0).unwrap();
 
+                // Create a descriptor/view
                 let create_view_info = vk::ImageViewCreateInfo::default()
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
@@ -582,6 +629,7 @@ impl Vk {
                     .data(vk::DescriptorDataEXT {
                         p_storage_image: &ii as *const _,
                     });
+                // Get the raw descriptor
                 let mut desc = [0u8; 32];
                 get_descriptor_device.get_descriptor(&info, &mut desc);
 
@@ -601,6 +649,7 @@ impl Vk {
 
             let width = surface_resolution.width / self.tile_size;
             let height = surface_resolution.height / self.tile_size;
+            // Create the two images used to store the game field
             let a = create_img(width, height);
             let b = create_img(width, height);
             let (screen_image, screen_image_view, screen_image_descriptor) = create_img_internal(
@@ -615,7 +664,7 @@ impl Vk {
             let content_image_descriptors = vec![a.2, b.2];
 
             if let Some(swapchain) = self.swapchain.take() {
-                // Copy old to new content images
+                // Copy old to new field images
                 record_submit_commandbuffer(
                     &self.device,
                     self.draw_command_buffer,
@@ -664,6 +713,7 @@ impl Vk {
                 surface_capabilities.current_transform
             };
 
+            // Create the swapchain and get framebuffer images
             let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
                 .surface(self.surface)
                 .min_image_count(desired_image_count)
@@ -733,6 +783,10 @@ impl Vk {
         }
     }
 
+    /// Render one frame.
+    ///
+    /// Calls the given function with the present index.
+    /// Then copies the `screen_image` to the framebuffer and presents the image.
     pub fn render<'a, F: FnMut(u32, &Self) + 'a>(&'a mut self, mut f: F) {
         unsafe {
             self.ensure_swapchain(false);
@@ -832,41 +886,6 @@ impl Vk {
                             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                             .dst_access_mask(vk::AccessFlags::empty())],
                     );
-                    /*device.cmd_begin_render_pass(
-                        draw_command_buffer,
-                        &render_pass_begin_info,
-                        vk::SubpassContents::INLINE,
-                    );
-                    device.cmd_bind_pipeline(
-                        draw_command_buffer,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        graphic_pipeline,
-                    );
-                    device.cmd_set_viewport(draw_command_buffer, 0, &viewports);
-                    device.cmd_set_scissor(draw_command_buffer, 0, &scissors);
-                    device.cmd_bind_vertex_buffers(
-                        draw_command_buffer,
-                        0,
-                        &[vertex_input_buffer],
-                        &[0],
-                    );
-                    device.cmd_bind_index_buffer(
-                        draw_command_buffer,
-                        index_buffer,
-                        0,
-                        vk::IndexType::UINT32,
-                    );
-                    device.cmd_draw_indexed(
-                        draw_command_buffer,
-                        index_buffer_data.len() as u32,
-                        1,
-                        0,
-                        0,
-                        1,
-                    );
-                    // Or draw without the index buffer
-                    // device.cmd_draw(draw_command_buffer, 3, 1, 0, 0);
-                    device.cmd_end_render_pass(draw_command_buffer);*/
                 },
             );
 
@@ -874,7 +893,7 @@ impl Vk {
             let swapchains = [swapchain.swapchain];
             let image_indices = [present_index];
             let present_info = vk::PresentInfoKHR::default()
-                .wait_semaphores(&wait_semaphors) // &self.rendering_complete_semaphore)
+                .wait_semaphores(&wait_semaphors)
                 .swapchains(&swapchains)
                 .image_indices(&image_indices);
 
@@ -884,23 +903,10 @@ impl Vk {
             self.device.device_wait_idle().unwrap();
         }
     }
-
-    pub fn clear(&self) {
-        unsafe {
-            self.device.device_wait_idle().unwrap();
-            /*self.device.free_memory(index_buffer_memory, None);
-            self.device.destroy_buffer(index_buffer, None);
-            self.device.free_memory(vertex_input_buffer_memory, None);
-            self.device.destroy_buffer(vertex_input_buffer, None);
-            for framebuffer in framebuffers {
-                self.device.destroy_framebuffer(framebuffer, None);
-            }
-            self.device.destroy_render_pass(renderpass, None);*/
-        }
-    }
 }
 
 impl Swapchain {
+    /// Clean up resources
     fn clear(&self, vk: &Vk) {
         unsafe {
             for &image_view in self.present_image_views.iter() {
@@ -920,6 +926,7 @@ impl Swapchain {
 }
 
 impl Drop for Vk {
+    /// Clean up resources
     fn drop(&mut self) {
         unsafe {
             self.device.device_wait_idle().unwrap();
@@ -939,6 +946,7 @@ impl Drop for Vk {
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);
             self.surface_loader.destroy_surface(self.surface, None);
+            #[cfg(debug_assertions)]
             self.debug_utils_loader
                 .destroy_debug_utils_messenger(self.debug_call_back, None);
             self.instance.destroy_instance(None);

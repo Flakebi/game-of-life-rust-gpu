@@ -1,3 +1,7 @@
+//! The GPU code to simulate game of life.
+//!
+//! Also contains some helper kernels.
+
 #![allow(
     internal_features,
     improper_ctypes,
@@ -18,23 +22,26 @@ extern crate alloc;
 
 use amdgpu_device_libs::prelude::*;
 
+/// An image descriptor
 #[derive(Clone, Copy)]
 #[repr(simd)]
 pub struct ImageDesc([u32; 8]);
 
+/// A sampler descriptor
 #[derive(Clone, Copy)]
 #[repr(simd)]
 pub struct SamplerDesc([u32; 4]);
 
+/// A color value
 #[derive(Clone, Copy)]
 #[repr(simd)]
 pub struct RGBA([f32; 4]);
 
-unsafe extern "C" {
-    safe fn __amdgpu_util_kernarg_segment_ptr() -> *const core::ffi::c_void;
-}
-
+/// Declare the used LLVM intrinsics
 unsafe extern "unadjusted" {
+    /// Sample from an image at the coordinate using the descriptors.
+    ///
+    /// Coordinates are between 0 and 1.
     #[link_name = "llvm.amdgcn.image.sample.lz.2d.f32.i32"]
     pub fn image_sample(
         dmask: u32,
@@ -47,12 +54,17 @@ unsafe extern "unadjusted" {
         aux: u32,
     ) -> u32;
 
+    /// Store a value into the image.
+    ///
+    /// The value must be given as float, but can be arbitrary 32 bits, depending on the image format.
+    ///
+    /// Coordinates are between 0 and image size.
     #[link_name = "llvm.amdgcn.image.store.2d.f32.i32"]
     pub fn image_store(data: f32, dmask: u32, x: u32, y: u32, img: ImageDesc, tfe: u32, aux: u32);
 
-    #[link_name = "llvm.amdgcn.image.load.2d.i32.i32"]
-    pub fn image_load(dmask: u32, x: u32, y: u32, img: ImageDesc, tfe: u32, aux: u32) -> u32;
-
+    /// Store a value into the image.
+    ///
+    /// Coordinates are between 0 and image size.
     #[link_name = "llvm.amdgcn.image.store.2d.v4f32.i32"]
     pub fn image_store_color(
         data: RGBA,
@@ -65,104 +77,66 @@ unsafe extern "unadjusted" {
     );
 }
 
-#[allow(dead_code)]
-struct KernelArgs {
-    old_content_desc: ImageDesc,
-    new_content_desc: ImageDesc,
-    screen_desc: ImageDesc,
-    sampler: SamplerDesc,
-    width: u32,
-    height: u32,
-    screen_width: u32,
-    screen_height: u32,
-}
-
+/// Sample a value from an image.
+///
+/// Coordinates are between 0 and image size.
 fn sample(img: ImageDesc, sampler: SamplerDesc, x: i32, y: i32, width: u32, height: u32) -> u32 {
     let x_f = (x as f32 + 0.5) / width as f32;
     let y_f = (y as f32 + 0.5) / height as f32;
     unsafe { image_sample(1, x_f, y_f, img, sampler, false, 0, 0) }
 }
 
+/// Store a value to an image.
+///
+/// Coordinates are between 0 and image size.
 fn store(img: ImageDesc, x: u32, y: u32, val: u32) {
     let val_f = f32::from_bits(val);
     unsafe { image_store(val_f, 1, x, y, img, 0, 0) };
 }
 
+/// The kernel that simulates one step and renders the new field to the screen.
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn kernel(
-    /*_: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-
-    _: u32,
-    _: u32,*/
+    // The field we read from
     old_content_desc: ImageDesc,
+    // The field we write to
     new_content_desc: ImageDesc,
+    // The image we render to
     screen_desc: ImageDesc,
+    // The sampler for reading the field
     sampler: SamplerDesc,
+    // Field width
     width: u32,
+    // Field height
     height: u32,
+    // Screen image width
     screen_width: u32,
+    // Screen image height
     screen_height: u32,
-    paused: u32,
 ) {
-    // let args: &KernelArgs = unsafe { &*(__amdgpu_util_kernarg_segment_ptr() as *const _) };
     let dispatch = dispatch_ptr();
 
     // Compute global coordinates
     let x = workgroup_id_x() * dispatch.workgroup_size_x as u32 + workitem_id_x();
     let y = workgroup_id_y() * dispatch.workgroup_size_y as u32 + workitem_id_y();
 
-    if x == 0 && y == 0 {
-        // println!("Is running with {}x{}", screen_width, screen_height);
-    }
-
-    // if x >= args.width || y >= args.height {
+    // Do nothing if this thread is outside of the field
     if x >= width || y >= height {
         return;
     }
 
     unsafe {
+        // Get old value of this cell
         let val = sample(old_content_desc, sampler, x as i32, y as i32, width, height);
-        // value is saved as direction (lower 3 bits) + age (upper 5 bits)
+        // value is saved as direction (lower 3 bits) + age (upper 5 bits),
+        // if the cell is dead, age is 0
         let dir = val & 7;
         let age = val >> 3;
         const MAX_AGE: f32 = 31.0;
 
-        // let val2 = image_load(1, x, y, old_content_desc, 0, 0);
-        if x == 0 && y == 0 {
-            // println!("Got {val} or {val2}");
-        }
-
+        // Iterate over neighboring cells and count how many are alive.
+        // Try to keep log of which direction neighbors are alive in.
         let mut new_dir_x = 0;
         let mut new_dir_y = 0;
         let mut sum = 0;
@@ -190,61 +164,64 @@ pub unsafe extern "gpu-kernel" fn kernel(
         new_dir_x = new_dir_x.clamp(-1, 1);
         new_dir_y = new_dir_y.clamp(-1, 1);
         let new_dir = if age != 0 {
-            // Keep dir
+            // Keep dir if this cell is already alive
             dir
         } else {
             (new_dir_x + 1) as u32 + ((new_dir_y + 1) << 1) as u32
         };
 
-        let new_age = if paused == 1 {
-            age
-        } else if age == 0 {
+        let new_age = if age == 0 {
             if sum == 3 {
                 // Becomes alive
                 1
             } else {
+                // Stays dead
                 0
             }
         } else if sum == 2 || sum == 3 {
-            // Increment age, cap at 255
+            // Stays alive
+            // Increment age, cap at 31
             31.min(age + 1)
         } else {
             // Dies
             0
         };
+
+        // Store the new state into the next image
         let mut new_val = new_age << 3;
         if new_age != 0 {
             new_val |= new_dir;
         }
         store(new_content_desc, x, y, new_val);
 
-        // Write screen image
+        // Scale up to screen size
         let x_screen = ((x as f32 / width as f32) * screen_width as f32) as u32;
         let next_x_screen = (((x + 1) as f32 / width as f32) * screen_width as f32) as u32;
         let y_screen = ((y as f32 / height as f32) * screen_height as f32) as u32;
         let next_y_screen = (((y + 1) as f32 / height as f32) * screen_height as f32) as u32;
 
-        /*if x == 0 && y == 0 {
-            println!(
-                "Write {val} to {x_screen}..{next_x_screen} x {y_screen}..{next_y_screen} ({width}x{height} to {screen_width}x{screen_height})"
-            );
-        }*/
-        // Color based on direction
+        // We choose a color based on direction.
+        // There is no grand underlying scheme, it should just look pretty.
         let red = 0.7 * (new_dir >> 1) as f32 / 3.0;
         let green = 0.7 * (new_dir & 3) as f32 / 3.0;
 
         let col = if new_age == 0 {
+            // Dead is black
             RGBA([0.0, 0.0, 0.0, 1.0])
         } else if new_age <= 5 {
+            // Steep linear gradient in the beginning
             RGBA([red, green, 1.0 - (new_age - 1) as f32 / 4.0 * 0.4, 1.0])
         } else {
-            // Steep linear gradient in the beginning, then cubic
+            // Cubic for older cells
             let mut v = new_age as f32 / MAX_AGE - 1.0;
             v = v * v;
             v = v * v;
             let age_ratio = v;
             RGBA([red, green, age_ratio * 0.5 + 0.1, 1.0])
         };
+
+        // Write screen image, this scales up as one cell in the field image usually corresponds to
+        // multiple pixels on the screen
         for i in x_screen..next_x_screen {
             for j in y_screen..next_y_screen {
                 image_store_color(col, 0xf, i, j, screen_desc, 0, 0);
@@ -253,6 +230,9 @@ pub unsafe extern "gpu-kernel" fn kernel(
     }
 }
 
+/// Kernel to initially clear the image.
+///
+/// Sets everything to zero.
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn clear(img: ImageDesc, width: u32, height: u32) {
@@ -269,38 +249,14 @@ pub unsafe extern "gpu-kernel" fn clear(img: ImageDesc, width: u32, height: u32)
     store(img, x, y, 0);
 }
 
+/// Kernel to set a specific cell in the image to alive or dead.
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn set(img: ImageDesc, x: u32, y: u32, val: u32) {
+    // Only the first thread does the store
     if workitem_id_x() != 0 || workitem_id_y() != 0 {
         return;
     }
 
-    // println!("GPU setting {x},{y} to {val}");
     store(img, x, y, val << 3);
-}
-
-#[allow(unused_variables, clippy::missing_safety_doc)]
-#[unsafe(no_mangle)]
-pub unsafe extern "gpu-kernel" fn check(
-    img: ImageDesc,
-    sampler: SamplerDesc,
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-    val: f32,
-) {
-    /*if workitem_id_x() != 0 || workitem_id_y() != 0 {
-        return;
-    }
-
-    let is_val = sample(img, sampler, x as i32, y as i32, width, height);
-    let is_val2 = unsafe { image_load(1, x, y, img, 0, 0) };
-    if is_val != (val == 1.0) {
-        println!("Check sample: {x},{y} is {is_val} but expected {val}");
-    }
-    if is_val2 as f32 / 255.0 != val {
-        println!("Check load: {x},{y} is {is_val2} but expected {val}");
-    }*/
 }
