@@ -358,6 +358,7 @@ impl vk::MyApp for App {
                 height: u32,
                 window_width: u32,
                 window_height: u32,
+                paused: u32,
             }
 
             let kernel_args = &mut KernelArgs {
@@ -369,6 +370,7 @@ impl vk::MyApp for App {
                 height: swapchain.height,
                 window_width: swapchain.surface_resolution.width,
                 window_height: swapchain.surface_resolution.height,
+                paused: if win.paused { 1 } else { 0 },
             };
             let mut size = std::mem::size_of_val(kernel_args);
 

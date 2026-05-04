@@ -114,6 +114,8 @@ pub unsafe extern "gpu-kernel" fn kernel(
     screen_width: u32,
     // Screen image height
     screen_height: u32,
+    // 1 if paused or 0 if not
+    paused: u32,
 ) {
     let dispatch = dispatch_ptr();
 
@@ -170,7 +172,9 @@ pub unsafe extern "gpu-kernel" fn kernel(
             (new_dir_x + 1) as u32 + ((new_dir_y + 1) << 1) as u32
         };
 
-        let new_age = if age == 0 {
+        let new_age = if paused == 1 {
+            age
+        } else if age == 0 {
             if sum == 3 {
                 // Becomes alive
                 1
