@@ -3,8 +3,6 @@
 //! It does not run any shaders, we extract the raw descriptors for the images and do the rendering
 //! in the Rust GPU kernels. The image written by the kernel is copied to the framebuffer.
 
-#[cfg(debug_assertions)]
-use std::borrow::Cow;
 use std::default::Default;
 use std::error::Error;
 use std::ffi;
@@ -175,36 +173,6 @@ pub fn record_submit_commandbuffer<F: FnOnce(&Device, vk::CommandBuffer)>(
     }
 }
 
-/// Print a vulkan message
-#[cfg(debug_assertions)]
-unsafe extern "system" fn vulkan_debug_callback(
-    message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
-    message_type: vk::DebugUtilsMessageTypeFlagsEXT,
-    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
-    _user_data: *mut std::os::raw::c_void,
-) -> vk::Bool32 {
-    let callback_data = unsafe { *p_callback_data };
-    let message_id_number = callback_data.message_id_number;
-
-    let message_id_name = if callback_data.p_message_id_name.is_null() {
-        Cow::from("")
-    } else {
-        unsafe { ffi::CStr::from_ptr(callback_data.p_message_id_name).to_string_lossy() }
-    };
-
-    let message = if callback_data.p_message.is_null() {
-        Cow::from("")
-    } else {
-        unsafe { ffi::CStr::from_ptr(callback_data.p_message).to_string_lossy() }
-    };
-
-    println!(
-        "{message_severity:?}:\n{message_type:?} [{message_id_name} ({message_id_number})] : {message}\n",
-    );
-
-    vk::FALSE
-}
-
 pub fn find_memorytype_index(
     memory_req: &vk::MemoryRequirements,
     memory_prop: &vk::PhysicalDeviceMemoryProperties,
@@ -262,12 +230,9 @@ pub struct Vk {
     pub device: Device,
     pub surface_loader: surface::Instance,
     pub swapchain_loader: swapchain::Device,
-    #[cfg(debug_assertions)]
-    pub debug_utils_loader: debug_utils::Instance,
+    pub debug_device: debug_utils::Device,
     /// Window dependent data
     pub window: Box<dyn Window>,
-    #[cfg(debug_assertions)]
-    pub debug_call_back: vk::DebugUtilsMessengerEXT,
 
     pub pdevice: vk::PhysicalDevice,
     pub device_memory_properties: vk::PhysicalDeviceMemoryProperties,
@@ -337,27 +302,6 @@ impl Vk {
             let instance: Instance = entry
                 .create_instance(&create_info, None)
                 .expect("Instance creation error");
-
-            #[cfg(debug_assertions)]
-            let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
-                .message_severity(
-                    vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
-                        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                        | vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
-                )
-                .message_type(
-                    vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                        | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
-                )
-                .pfn_user_callback(Some(vulkan_debug_callback));
-
-            #[cfg(debug_assertions)]
-            let debug_utils_loader = debug_utils::Instance::new(&entry, &instance);
-            #[cfg(debug_assertions)]
-            let debug_call_back = debug_utils_loader
-                .create_debug_utils_messenger(&debug_info, None)
-                .unwrap();
 
             let surface = ash_window::create_surface(
                 &entry,
@@ -496,6 +440,8 @@ impl Vk {
                 .create_semaphore(&semaphore_create_info, None)
                 .unwrap();
 
+            let debug_device = debug_utils::Device::new(&instance, &device);
+
             Ok(Self {
                 entry,
                 instance,
@@ -510,6 +456,7 @@ impl Vk {
                 present_mode,
                 swapchain_loader,
                 swapchain: None,
+                debug_device,
                 content_image_sampler_desc,
                 content_image_sampler,
                 pool,
@@ -518,13 +465,22 @@ impl Vk {
                 rendering_complete_semaphore,
                 draw_commands_reuse_fence,
                 surface,
-                #[cfg(debug_assertions)]
-                debug_call_back,
-                #[cfg(debug_assertions)]
-                debug_utils_loader,
                 tile_size: 16,
                 paused: false,
             })
+        }
+    }
+
+    /// Set a debug name for an object
+    pub fn set_name<T: vk::Handle>(&self, handle: T, name: &std::ffi::CStr) {
+        unsafe {
+            self.debug_device
+                .set_debug_utils_object_name(
+                    &vk::DebugUtilsObjectNameInfoEXT::default()
+                        .object_handle(handle)
+                        .object_name(name),
+                )
+                .expect("Failed to set name");
         }
     }
 
@@ -650,12 +606,15 @@ impl Vk {
             // Create the two images used to store the game field
             let a = create_img(width, height);
             let b = create_img(width, height);
+            self.set_name(a.0, c"Field image a");
+            self.set_name(b.0, c"Field image b");
             let (screen_image, screen_image_view, screen_image_descriptor) = create_img_internal(
                 surface_resolution.width,
                 surface_resolution.height,
                 self.surface_format.format,
                 vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
             );
+            self.set_name(screen_image, c"Screen image");
 
             let content_images = vec![a.0, b.0];
             let content_image_views = vec![a.1, b.1];
@@ -663,6 +622,8 @@ impl Vk {
 
             if let Some(swapchain) = self.swapchain.take() {
                 // Copy old to new field images
+                self.set_name(self.draw_command_buffer, c"Copy old to new field images");
+
                 record_submit_commandbuffer(
                     &self.device,
                     self.draw_command_buffer,
@@ -691,8 +652,9 @@ impl Vk {
 
                         for i in 0..swapchain.content_images.len() {
                             let src_image_barrier = vk::ImageMemoryBarrier::default()
-                                .old_layout(vk::ImageLayout::UNDEFINED)
+                                .old_layout(vk::ImageLayout::GENERAL)
                                 .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                                .src_access_mask(vk::AccessFlags::NONE)
                                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -701,6 +663,7 @@ impl Vk {
                             let dst_image_barrier = vk::ImageMemoryBarrier::default()
                                 .old_layout(vk::ImageLayout::UNDEFINED)
                                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                                .src_access_mask(vk::AccessFlags::NONE)
                                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -718,6 +681,36 @@ impl Vk {
                                 &[src_image_barrier, dst_image_barrier],
                             );
 
+                            // Clear dst image
+                            device.cmd_clear_color_image(
+                                draw_command_buffer,
+                                content_images[i],
+                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                &vk::ClearColorValue::default(),
+                                &[sub_range],
+                            );
+
+                            let image_barrier = vk::ImageMemoryBarrier::default()
+                                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .image(content_images[i])
+                                .subresource_range(sub_range);
+
+                            device.cmd_pipeline_barrier(
+                                draw_command_buffer,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::DependencyFlags::empty(),
+                                &[] as &[vk::MemoryBarrier],
+                                &[] as &[vk::BufferMemoryBarrier],
+                                &[image_barrier],
+                            );
+
+                            // Copy old to now image
                             let copy_info = vk::CopyImageInfo2::default()
                                 .src_image(swapchain.content_images[i])
                                 .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -725,13 +718,143 @@ impl Vk {
                                 .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                                 .regions(&regions);
                             device.cmd_copy_image2(draw_command_buffer, &copy_info);
+
+                            let image_barrier = vk::ImageMemoryBarrier::default()
+                                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                                .new_layout(vk::ImageLayout::GENERAL)
+                                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                .dst_access_mask(vk::AccessFlags::NONE)
+                                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .image(content_images[i])
+                                .subresource_range(sub_range);
+
+                            device.cmd_pipeline_barrier(
+                                draw_command_buffer,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                                vk::DependencyFlags::empty(),
+                                &[] as &[vk::MemoryBarrier],
+                                &[] as &[vk::BufferMemoryBarrier],
+                                &[image_barrier],
+                            );
                         }
+
+                        let image_barrier = vk::ImageMemoryBarrier::default()
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::GENERAL)
+                            .src_access_mask(vk::AccessFlags::NONE)
+                            .dst_access_mask(vk::AccessFlags::NONE)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(screen_image)
+                            .subresource_range(sub_range);
+
+                        device.cmd_pipeline_barrier(
+                            draw_command_buffer,
+                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                            vk::DependencyFlags::empty(),
+                            &[] as &[vk::MemoryBarrier],
+                            &[] as &[vk::BufferMemoryBarrier],
+                            &[image_barrier],
+                        );
                     },
                 );
 
                 self.device.device_wait_idle().unwrap();
 
                 swapchain.clear(self);
+            } else {
+                // Transfer image layout
+                self.set_name(self.draw_command_buffer, c"Set field image layout");
+
+                record_submit_commandbuffer(
+                    &self.device,
+                    self.draw_command_buffer,
+                    self.draw_commands_reuse_fence,
+                    self.present_queue,
+                    &[],
+                    &[],
+                    &[],
+                    |device, draw_command_buffer| {
+                        let sub_range = vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1);
+                        for i in 0..content_images.len() {
+                            let image_barrier = vk::ImageMemoryBarrier::default()
+                                .old_layout(vk::ImageLayout::UNDEFINED)
+                                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                                .src_access_mask(vk::AccessFlags::NONE)
+                                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .image(content_images[i])
+                                .subresource_range(sub_range);
+
+                            device.cmd_pipeline_barrier(
+                                draw_command_buffer,
+                                vk::PipelineStageFlags::TOP_OF_PIPE,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::DependencyFlags::empty(),
+                                &[] as &[vk::MemoryBarrier],
+                                &[] as &[vk::BufferMemoryBarrier],
+                                &[image_barrier],
+                            );
+
+                            // Clear dst image
+                            device.cmd_clear_color_image(
+                                draw_command_buffer,
+                                content_images[i],
+                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                &vk::ClearColorValue::default(),
+                                &[sub_range],
+                            );
+
+                            let image_barrier = vk::ImageMemoryBarrier::default()
+                                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                                .new_layout(vk::ImageLayout::GENERAL)
+                                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                .dst_access_mask(vk::AccessFlags::NONE)
+                                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                                .image(content_images[i])
+                                .subresource_range(sub_range);
+
+                            device.cmd_pipeline_barrier(
+                                draw_command_buffer,
+                                vk::PipelineStageFlags::TRANSFER,
+                                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                                vk::DependencyFlags::empty(),
+                                &[] as &[vk::MemoryBarrier],
+                                &[] as &[vk::BufferMemoryBarrier],
+                                &[image_barrier],
+                            );
+                        }
+
+                        let image_barrier = vk::ImageMemoryBarrier::default()
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::GENERAL)
+                            .src_access_mask(vk::AccessFlags::NONE)
+                            .dst_access_mask(vk::AccessFlags::NONE)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(screen_image)
+                            .subresource_range(sub_range);
+
+                        device.cmd_pipeline_barrier(
+                            draw_command_buffer,
+                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                            vk::DependencyFlags::empty(),
+                            &[] as &[vk::MemoryBarrier],
+                            &[] as &[vk::BufferMemoryBarrier],
+                            &[image_barrier],
+                        );
+                    },
+                );
+                self.device.device_wait_idle().unwrap();
             }
 
             let pre_transform = if surface_capabilities
@@ -772,6 +895,8 @@ impl Vk {
             let present_image_views: Vec<vk::ImageView> = present_images
                 .iter()
                 .map(|&image| {
+                    self.set_name(image, c"Swapchain image");
+
                     let create_view_info = vk::ImageViewCreateInfo::default()
                         .view_type(vk::ImageViewType::TYPE_2D)
                         .format(self.surface_format.format)
@@ -833,7 +958,8 @@ impl Vk {
                     .unwrap()
             };
             if suboptimal {
-                // Reset semaphore
+                println!("Is suboptimal");
+                // Wait for semaphore from acquire_next_image
                 record_submit_commandbuffer(
                     &self.device,
                     self.draw_command_buffer,
@@ -846,7 +972,6 @@ impl Vk {
                 );
                 self.device.device_wait_idle().unwrap();
 
-                println!("Is suboptimal");
                 self.ensure_swapchain(true);
                 let swapchain = self.swapchain.as_ref().unwrap();
                 present_index = self
@@ -864,6 +989,7 @@ impl Vk {
             let swapchain = self.swapchain.as_ref().unwrap();
 
             let present_image = swapchain.present_images[present_index as usize];
+            self.set_name(self.draw_command_buffer, c"Copy rendered image");
             record_submit_commandbuffer(
                 &self.device,
                 self.draw_command_buffer,
@@ -885,20 +1011,15 @@ impl Vk {
                                 .height(swapchain.surface_resolution.height)
                                 .depth(1),
                         )];
-                    let copy_info = vk::CopyImageInfo2::default()
-                        .src_image(swapchain.screen_image)
-                        .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                        .dst_image(present_image)
-                        .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                        .regions(&regions);
 
                     let sub_range = vk::ImageSubresourceRange::default()
                         .aspect_mask(vk::ImageAspectFlags::COLOR)
                         .level_count(1)
                         .layer_count(1);
                     let src_image_barrier = vk::ImageMemoryBarrier::default()
-                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .old_layout(vk::ImageLayout::GENERAL)
                         .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .src_access_mask(vk::AccessFlags::NONE)
                         .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -907,6 +1028,7 @@ impl Vk {
                     let dst_image_barrier = vk::ImageMemoryBarrier::default()
                         .old_layout(vk::ImageLayout::UNDEFINED)
                         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .src_access_mask(vk::AccessFlags::NONE)
                         .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -921,7 +1043,33 @@ impl Vk {
                         &[],
                         &[src_image_barrier, dst_image_barrier],
                     );
+
+                    let copy_info = vk::CopyImageInfo2::default()
+                        .src_image(swapchain.screen_image)
+                        .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .dst_image(present_image)
+                        .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .regions(&regions);
                     device.cmd_copy_image2(draw_command_buffer, &copy_info);
+
+                    let src_image_barrier = vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .dst_access_mask(vk::AccessFlags::NONE)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(swapchain.screen_image)
+                        .subresource_range(sub_range);
+                    let dst_image_barrier = vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::NONE)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(present_image)
+                        .subresource_range(sub_range);
                     device.cmd_pipeline_barrier(
                         draw_command_buffer,
                         vk::PipelineStageFlags::TRANSFER,
@@ -929,15 +1077,7 @@ impl Vk {
                         vk::DependencyFlags::default(),
                         &[],
                         &[],
-                        &[vk::ImageMemoryBarrier::default()
-                            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                            .image(present_image)
-                            .subresource_range(sub_range)
-                            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                            .dst_access_mask(vk::AccessFlags::empty())],
+                        &[src_image_barrier, dst_image_barrier],
                     );
                 },
             );
@@ -973,8 +1113,9 @@ impl Swapchain {
             for &image in self.content_images.iter() {
                 vk.device.destroy_image(image, None);
             }
-            for &mem in self.mem.iter() {
-                vk.device.free_memory(mem, None);
+            for &_mem in self.mem.iter() {
+                // TODO Something goes wrong when freeing this memory and resizing
+                // vk.device.free_memory(mem, None);
             }
             vk.swapchain_loader.destroy_swapchain(self.swapchain, None);
         }
@@ -1000,9 +1141,6 @@ impl Drop for Vk {
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);
             self.surface_loader.destroy_surface(self.surface, None);
-            #[cfg(debug_assertions)]
-            self.debug_utils_loader
-                .destroy_debug_utils_messenger(self.debug_call_back, None);
             self.instance.destroy_instance(None);
         }
     }
